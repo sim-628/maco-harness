@@ -12,6 +12,7 @@ MODEL_PROVIDER_HOSTS=
 # Per-user admission bounds; execution concurrency remains 2 tasks / 4 writes / 1 maintenance job.
 MAX_OPEN_TASKS=32
 MAX_PENDING_OPERATIONS=256
+CONTEXT_INPUT_BYTES=65536
 
 # Generate once per deployment with openssl rand -base64 32. Retain the key across restarts.
 CONNECTION_ENCRYPTION_KEY=

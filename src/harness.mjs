@@ -4,13 +4,16 @@ import { validateTool } from './tool-policy.mjs'
 import { requireThat, errorCode, identifier, messageText, checkedVersion } from './protocol.mjs'
 import { finishedOps } from './mail-executor.mjs'
 import { taskView } from './store.mjs'
+import { HISTORY_TOOLS } from './history/index.mjs'
+import { projectHistoryMessage } from './history-projection.mjs'
+import { ModelError } from './model/stream.mjs'
 
 const LIMITS = {steps:12, tools:32, attempts:15, output:2048, reads:3}
-const RUN_POLICY = 'maco-mail-v1'
+const RUN_POLICY = 'maco-mail-v2'
 
 export class Harness {
-  constructor(store, connections, mail, {stream = streamStep, read = readMailTool, memory, maxOpenTasks = 32} = {}) {
-    Object.assign(this, {store, connections, mail, stream, read, memory, maxOpenTasks})
+  constructor(store, connections, mail, {stream = streamStep, read = readMailTool, memory, compaction, maxOpenTasks = 32} = {}) {
+    Object.assign(this, {store, connections, mail, stream, read, memory, compaction, maxOpenTasks})
   }
   bind(profile, mailboxId) {
     requireThat(profile && typeof profile === 'object', 'model_profile_required')
@@ -28,7 +31,7 @@ export class Harness {
     const open = this.store.one("SELECT COUNT(*) AS count FROM tasks WHERE state IN ('queued','running','waiting_mail','needs_review') AND id<>?",t.id).count
     requireThat(open < this.maxOpenTasks,'task_capacity_reached',429)
     Object.assign(t, binding, {runId:crypto.randomUUID(), runStartedAt:Date.now(), policyVersion:RUN_POLICY, state:'queued',
-      step:0, toolCount:0, attempts:0, failures:0, pending:null, attempt:null, lastUsage:null, waitingOperationId:null, due:0, error:null})
+      step:0, toolCount:0, attempts:0, compactionAttempts:0, failures:0, pending:null, attempt:null, lastUsage:null, waitingOperationId:null, due:0, error:null,context:null})
     this.store.saveTask(t)
     this.store.event('run.started',{...taskView(t), policyVersion:RUN_POLICY})
     const turn = this.store.appendMessage(t, {role:'user',content:messageText(message)})
@@ -56,7 +59,7 @@ export class Harness {
         op.version++
         this.store.saveOp(op)
       }
-      this.store.appendMessage(t,{role:'tool',toolCallId:call.id,
+      this.store.appendMessage(t,{role:'tool',toolCallId:call.id,toolName:call.name,
         content:JSON.stringify({state:op?.state || 'cancelled',operationId:op?.id})})
     }
     t.pending = null
@@ -87,17 +90,42 @@ export class Harness {
     this.connections.assertEpoch(t.mailboxId,t.mailEpoch)
   }
   opId(t,index) { return 'tool:' + t.runId + ':' + t.step + ':' + index }
+  memorySettings() { return this.memory?.state() || {enabled:false,epoch:0} }
+  assertMemory(epoch) {
+    if (this.memorySettings().epoch !== epoch) throw new ModelError('memory_context_changed',{retryable:true})
+  }
   async model(t, signal) {
     requireThat(t.step < LIMITS.steps && t.attempts < LIMITS.attempts,'model_budget_exhausted')
     const stepStart = Date.now()
-    const tools = mailToolsFor(this.mail.metadata(t.mailboxId,t.mailEpoch))
-    const memoryContext = this.memory?.context(t.id,{maxBytes:6000})
-    const messages = buildContext({messages:this.store.contextMessages(t.id), tools, memoryContext, runStartedAt:t.runStartedAt, timeZone:t.timeZone})
     const credential = this.connections.modelCredential ? await this.connections.modelCredential(t.profile.connectionId,t.modelEpoch)
       : {apiKey:await this.connections.credential(t.profile.connectionId,t.modelEpoch)}
     this.current(t)
+    const memorySettings = this.memorySettings()
+    const tools = [...mailToolsFor(this.mail.metadata(t.mailboxId,t.mailEpoch)), ...(memorySettings.enabled ? HISTORY_TOOLS : [])]
+    const memoryContext = this.memory?.context(t.id,{maxBytes:6000,mailboxId:t.mailboxId})
+    const historyBeforeN = this.store.one('SELECT COALESCE(MAX(n),0)+1 AS n FROM messages WHERE task=?',t.id).n
+    const assertCurrent = () => { signal.throwIfAborted(); this.current(t); this.assertMemory(memorySettings.epoch) }
+    const projectMessage = message => projectHistoryMessage(message,memorySettings)
+    const prepared = this.compaction ? await this.compaction.prepare(t,{
+      tools,memoryContext,credential,signal,assertCurrent,projectMessage,memoryEpoch:memorySettings.epoch,
+      beforeSummary:() => {
+        assertCurrent()
+        requireThat(t.attempts < LIMITS.attempts-1 && (t.compactionAttempts || 0) < 2,'compaction_budget_exhausted')
+        t.compactionAttempts = (t.compactionAttempts || 0)+1
+        t.attempts++
+        this.store.tx(() => this.store.saveTask(t,false))
+      }
+    }) : {messages:buildContext({messages:this.store.contextMessages(t.id).map(projectMessage),tools,memoryContext,
+      runStartedAt:t.runStartedAt,timeZone:t.timeZone})}
+    const messages = prepared.messages
+    assertCurrent()
+    const usedHistory = Boolean(memoryContext?.facts?.length || memoryContext?.preferences?.length || memoryContext?.relatedHistory?.length ||
+      prepared.containsHistory || prepared.checkpoint?.containsHistory ||
+      messages.some(message => message.historyEpoch === memorySettings.epoch))
     const messageId = crypto.randomUUID()
     const started = Date.now()
+    t.context = {estimatedBytes:prepared.estimatedBytes ?? null,checkpointVersion:prepared.checkpoint?.version || 0,
+      coverage:prepared.coverage || null,warnings:prepared.warnings || []}
     t.attempt = messageId
     t.lastUsage = null
     t.attempts++
@@ -105,7 +133,7 @@ export class Harness {
     this.store.tx(() => {
       this.store.saveTask(t,false)
       this.store.event('attempt.started',{taskId:t.id,runId:t.runId,messageId,attempt:t.attempts,step:t.step+1,
-        payer:'user_connection', preparationMs:started-stepStart, requestedEffort:t.profile.effort})
+        payer:'user_connection', preparationMs:started-stepStart, requestedEffort:t.profile.effort,context:t.context})
     })
     let content = '', buffered = '', lastBatch = started, firstTokenMs = null, finish, usage = null
     const calls = []
@@ -117,7 +145,7 @@ export class Harness {
       lastBatch = Date.now()
     }
     for await (const item of this.stream({profile:t.profile,credential,messages,tools,signal,maxOutputTokens:LIMITS.output})) {
-      this.current(t)
+      assertCurrent()
       if (item.type === 'text_delta') {
         firstTokenMs ??= Date.now() - started
         content += item.text
@@ -139,7 +167,7 @@ export class Harness {
       } else if (item.type === 'warning') event('model.warning',{code:item.code || 'model_warning'})
       else if (item.type === 'finish') finish = item
     }
-    this.current(t)
+    assertCurrent()
     requireThat(finish && ((finish.reason === 'tool_calls') === Boolean(calls.length)),'incomplete_model_step')
     this.store.tx(() => {
       flush()
@@ -147,8 +175,10 @@ export class Harness {
       t.toolCount += calls.length
       t.attempt = null
       t.failures = 0
-      t.pending = calls.length ? {calls,index:0} : null
+      t.error = null
+      t.pending = calls.length ? {calls,index:0,historyBeforeN,memoryEpoch:memorySettings.epoch} : null
       this.store.appendMessage(t,{role:'assistant',content,messageId,...(calls.length ? {toolCalls:calls} : {}),
+        ...(usedHistory ? {historyEpoch:memorySettings.epoch} : {}),
         ...(finish.providerState ? {providerState:finish.providerState} : {})})
       this.memory?.observe(t.id,messageId,{profile:t.profile,modelEpoch:t.modelEpoch})
       if (firstTokenMs !== null) this.store.timing('model_first_text',firstTokenMs)
@@ -157,14 +187,25 @@ export class Harness {
       this.store.saveTask(t)
     })
   }
-  commitTool(t, call, result) {
-    this.store.appendMessage(t,{role:'tool',toolCallId:call.id,content:JSON.stringify(result)})
+  commitTool(t, call, result, reference = {}) {
+    this.store.appendMessage(t,{role:'tool',toolCallId:call.id,toolName:call.name,content:JSON.stringify(result),...reference})
     t.pending.index++
     if (t.pending.index === t.pending.calls.length) t.pending = null
   }
   async tools(t, signal) {
     const {calls,index} = t.pending
     const call = calls[index]
+    if (t.pending.memoryEpoch !== undefined && t.pending.memoryEpoch !== this.memorySettings().epoch &&
+        !(call.name === 'mail_write' && this.store.getOp(this.opId(t,index)))) {
+      // Complete every pending pair with an unavailable result, then ask the
+      // model again with current memory. Existing ledger operations still flow
+      // through the normal receipt path so an executed action is never forgotten.
+      this.store.tx(() => {
+        for (const item of calls.slice(index)) this.commitTool(t,item,{error:'memory_context_changed',executed:false})
+        this.store.saveTask(t,false)
+      })
+      return
+    }
     if (call.name !== 'mail_write') {
       // DeepSeek Harness batch.ts: dispatch independent reads together; commit in model order.
       const batch = []
@@ -172,17 +213,28 @@ export class Harness {
         if (item.name === 'mail_write') break
         batch.push(item)
       }
-      const context = await this.mail.context(t.mailboxId,t.mailEpoch)
+      const needsMail = batch.some(item => !['history_search','history_read'].includes(item.name))
+      const context = needsMail ? await this.mail.context(t.mailboxId,t.mailEpoch) : null
       this.current(t)
+      const historyEpoch = this.memorySettings().epoch
+      this.assertMemory(t.pending.memoryEpoch ?? historyEpoch)
+      const historyScope = {callerTaskId:t.id,mailboxId:t.mailboxId,beforeN:t.pending.historyBeforeN}
       const results = await Promise.all(batch.map(async item => {
         const started = Date.now()
-        try { return await this.read(item.name,item.arguments,{...context,signal}) }
+        try {
+          signal.throwIfAborted()
+          if (item.name === 'history_search') return this.memory.history.search(item.arguments,historyScope)
+          if (item.name === 'history_read') return this.memory.history.read(item.arguments,historyScope)
+          return await this.read(item.name,item.arguments,{...context,signal})
+        }
         catch (error) { return {error:errorCode(error,'read_failed')} }
-        finally { this.store.timing('read_tool',Date.now()-started) }
+        finally { this.store.timing(item.name.startsWith('history_') ? 'history_tool' : 'read_tool',Date.now()-started) }
       }))
       this.current(t)
+      this.assertMemory(historyEpoch)
       this.store.tx(() => {
-        for (const [i,item] of batch.entries()) this.commitTool(t,item,results[i])
+        for (const [i,item] of batch.entries()) this.commitTool(t,item,results[i],
+          item.name.startsWith('history_') ? {historyEpoch} : {})
         this.store.saveTask(t,false)
       })
       return
@@ -204,6 +256,7 @@ export class Harness {
         return
       }
       this.current(t)
+      this.assertMemory(t.pending.memoryEpoch ?? this.memorySettings().epoch)
       op = this.store.tx(() => this.mail.accept(plan,{id,commandId:id,taskId:t.id}))
     }
     this.store.tx(() => {
@@ -232,6 +285,11 @@ export class Harness {
     } catch (error) {
       const latest = this.store.getTask(t.id)
       if (latest.runId !== t.runId || latest.state !== 'running') return
+      if (error.code === 'memory_context_changed' && latest.pending) {
+        // A read-only preparation may have yielded while memory changed. Close
+        // its still-unexecuted calls before retrying with a fresh context.
+        this.store.tx(() => this.stopPending(latest))
+      }
       const retry = !latest.pending && error.retryable && latest.failures < 2 && latest.attempts < LIMITS.attempts
       this.store.tx(() => {
         if (latest.attempt) this.store.event('attempt.abandoned',{taskId:t.id,runId:t.runId,messageId:latest.attempt,usage:latest.lastUsage})

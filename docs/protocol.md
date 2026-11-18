@@ -218,9 +218,52 @@ settings 初始 version 为 1，此后使用当前版本。配置响应 `{accept
 
 后台提取最多 16 个排队任务、64 个待决提案、每 UTC 日 8 次模型尝试、每任务最多 2 次、单次 30 秒和最多 1000 输出 token；由维护调度器在没有前台模型工作时运行。使用原任务模型连接并记录 usage，不代表免费。
 
-`GET /v1/memory/context?taskId=…&query=…` 返回 facts、preferences、relatedHistory 与 coverage。query 可省略，默认取当前 Task 最近用户消息。检索限于同一用户的其他 Task，排除工具输出及私有 providerState；FTS 与中文双字实现关键词相关性，无 embedding。历史回填每次最多 256 条并保留游标，不完整时 coverage 会说明。注入模型的总上下文有字节预算。
+`GET /v1/memory/context?taskId=…&query=…` 返回 facts、preferences、relatedHistory 与 coverage。query 可省略，默认取当前 Task 最近用户消息。此同账号查看接口检索其他 Task；模型准备路径额外限定当前任务邮箱。来源包含用户 / 助理文字与允许的邮件元数据、执行回执投影，排除完整工具正文 / 附件、检索回显及私有 providerState。FTS 与中文双字实现关键词相关性，无 embedding。回填每次最多 256 条或约 1 MiB，持久保存游标；coverage.hasMore 表示尚未完成。
 
 删除会清除活动值、证据和来源，保留 key tombstone，抑制其来源再次检索并取消旧提取。原聊天、过去事件和审计记录未物理删除；停用记忆不等于删除账户数据。账户擦除 / 历史期限另需产品实现。
+
+### 6.1. 按需历史查询
+
+记忆启用时，模型自动获得 `history_search` / `history_read`。App 可以通过下面两个只读 POST 接口使用相同服务，不需要 commandId。callerTaskId 必须是当前登录账号已有的 Task；服务端从该 Task 推出邮箱范围，不接收 userId 或任意邮箱授权参数。
+
+`POST /v1/history/search`：
+
+```json
+{
+  "callerTaskId": "current-task-id",
+  "query": "Acme 报价",
+  "after": "2026-11-01T00:00:00+08:00",
+  "before": "2026-12-01T00:00:00+08:00"
+}
+```
+
+替换示例中的任务 ID。after / before 可省略，分别包含下界 / 排除上界。可增加 taskId 搜索特定任务；省略则按其他任务聚合。工具查询是全部归一化词匹配，最多 16 个不同词；过宽返回 history_query_too_broad。新消息含 createdAt；旧消息没有时间戳时，不参与时间过滤。
+
+响应 `{result:{results,coverage,capped,…}}`。每条结果包含 taskId、messageId、taskState、role、content、offset、offsetUnit、sourceChars、indexedChars、indexTruncated 等；最多 8 条。超过候选处理上限返回 coverage.candidateLimited，应缩小查询；有回填缺口或截断时，无结果不能证明原历史不存在。
+
+`POST /v1/history/read`：
+
+```json
+{
+  "callerTaskId": "current-task-id",
+  "taskId": "matched-task-id",
+  "messageId": "matched-message-id",
+  "offset": 0,
+  "neighbors": 1
+}
+```
+
+响应 `{result:{taskId,messageId,role,content,offset,nextOffset,totalChars,neighbors,projection,projectionLimited,redacted,…}}`。nextOffset 非 null 时以它继续读取同一来源；单位为 Unicode code points。一次完整 JSON 至多 12000 UTF-8 字节。neighbors 取 0–2，每侧最多相应数量的短摘要。
+
+用户 / 助理文本可读完公开投影，邮件工具只返回允许的元数据和执行回执。需要正文或当前状态时改用 mail_read 等邮件工具。精读和每个邻居检查同账号、邮箱、启用水位、来源排除和 epoch，猜测外部 ID 或读取已排除来源返回 history_source_not_found。
+
+### 6.2. 上下文与摘要事件
+
+Task 的 `context` 及 `attempt.started.context` 返回 estimatedBytes、checkpointVersion、coverage、warnings。coverage.complete 只描述本次任务上下文的记录覆盖；工具裁剪由 warnings 单独标记，不保证语义上保留所有细节。
+
+`context.compaction_started`、`context.compaction_finished`、`context.compaction_failed` 通过原事件流同步摘要进度与费用信息。摘要最多两次尝试 / run，使用原模型连接；没有新 API key，也不向摘要请求开放工具。后台偏好提取和任务压缩是不同事件及预算。
+
+关闭或删除记忆会使旧 epoch 的历史引用和摘要失效。历史原始聊天仍可在任务页面查看；已执行邮件操作的账本回执继续有效，不能因重新生成上下文而重复派发。详细覆盖与费用边界见 [历史检索与上下文](history-and-context.md)。
 
 ## 7. 多端快照、事件与恢复
 
@@ -229,9 +272,9 @@ settings 初始 version 为 1，此后使用当前版本。配置响应 `{accept
 1. `GET /v1/events?after=<seq>` 返回 events、committedCursor、hasMore；将事件和最后应用的 seq 放在同一本地事务。
 2. `GET /v1/socket?after=<seq>` 升级 WebSocket。原生端带 Bearer header；浏览器用子协议 `["maco.v1","bearer."+accessToken]`，服务端只回选 maco.v1。
 3. 只应用连续 seq，重复跳过，缺号通过 HTTP 补齐；回传 `{"type":"ack","seq":42}`。积压超过 128 条或 token 到期时重新连接，使用最新 token 与本地 cursor。
-4. attempt.started 分配 messageId，message.delta 追加，message.committed 替换临时内容，attempt.abandoned 撤下中断输出。task.updated、mail.updated、mail.observed、connection.updated 及 memory 事件更新投影。关闭设备不取消云端任务。
+4. attempt.started 分配 messageId，message.delta 追加，message.committed 替换临时内容，attempt.abandoned 撤下中断输出。task.updated、mail.updated、mail.observed、connection.updated、memory 及 context.compaction_* 事件更新投影。关闭设备不取消云端任务。
 
-`GET /v1/metrics` 返回当前用户最近约 4096 条计时样本的 count、p50Ms、p95Ms；覆盖受理、模型前准备、首段可见文本、邮箱读写、广播与回放。模型 usage 按尝试记录累计快照，缺失为 null。设备展示延迟、真实供应商计费与生产性能仍需实测。
+`GET /v1/metrics` 返回当前用户最近约 4096 条计时样本的 count、p50Ms、p95Ms；覆盖受理、模型前准备、首段可见文本、邮箱读写、history_tool、广播与回放。正常模型及摘要 usage 分别按尝试记录，缺失为 null。设备展示延迟、真实供应商计费与生产性能仍需实测。
 
 ## 8. Swift 接入
 

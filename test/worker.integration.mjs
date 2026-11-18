@@ -81,6 +81,28 @@ function fakeProviders(login, counts) {
       const {messages,tools} = await req.json();
       assert.ok(tools.some(tool => tool.function.name === 'mail_search'));
       counts.model++;
+      if (counts.historyMode) {
+        assert.ok(tools.some(tool => tool.function.name === 'history_search'));
+        assert.ok(tools.some(tool => tool.function.name === 'history_read'));
+        const read = messages.find(message => message.tool_call_id === 'history-read');
+        if (read) {
+          const value = JSON.parse(read.content);
+          assert.equal(value.taskId,counts.historyTarget);
+          assert.match(value.content,/报销发票/);
+          counts.historyReads = (counts.historyReads || 0)+1;
+          return stream({content:'Read the original AlphaLaunch decision.'},'stop');
+        }
+        const searched = messages.find(message => message.tool_call_id === 'history-search');
+        if (searched) {
+          const hit = JSON.parse(searched.content).results.find(item => item.taskId === counts.historyTarget);
+          assert.ok(hit,'historical task was not found');
+          counts.historySource = hit.messageId;
+          return stream({tool_calls:[{index:0,id:'history-read',type:'function',function:{name:'history_read',
+            arguments:JSON.stringify({taskId:hit.taskId,messageId:hit.messageId,neighbors:1})}}]},'tool_calls');
+        }
+        return stream({tool_calls:[{index:0,id:'history-search',type:'function',function:{name:'history_search',
+          arguments:JSON.stringify({query:'报销发票'})}}]},'tool_calls');
+      }
       if(counts.simpleReplies)return stream({content:'Understood. AlphaLaunch context retained.'},'stop');
       const result = messages.find(message => message.role === 'tool');
       if (result) {
@@ -261,6 +283,19 @@ test('workerd supports indexed mail IDs, CORS and editable isolated personal mem
   assert.ok(related.facts.some(item=>item.key==='account.time_zone'&&item.value==='Asia/Tokyo'));
   assert.deepEqual((await request(login.bob,'memory/context?query='+encodeURIComponent('报销'))).relatedHistory,[]);
 
+  counts.historyMode=true;counts.historyTarget=prior.taskId;
+  const mailReadsBeforeHistory=counts.reads;
+  const recalled=await task('Look up the earlier expense decision and read its exact source.');
+  counts.historyMode=false;
+  assert.equal(counts.historyReads,1);
+  assert.equal(counts.reads,mailReadsBeforeHistory,'history-only tools must not read Gmail');
+  assert.ok(recalled.messages.some(message=>message.toolName==='history_read'));
+  const found=await request(login.alice,'history/search',{callerTaskId:recalled.taskId,query:'报销发票'});
+  assert.ok(found.result.results.some(hit=>hit.messageId===counts.historySource));
+  const exact=await request(login.alice,'history/read',{callerTaskId:recalled.taskId,taskId:prior.taskId,messageId:counts.historySource});
+  assert.match(exact.result.content,/报销发票/);
+  await request(login.bob,'history/read',{callerTaskId:recalled.taskId,taskId:prior.taskId,messageId:counts.historySource},404);
+
   const after=new Date(Date.now()-7*86400000).toISOString();
   const accepted=await request(login.alice,'commands',cmd('mail.sync',{mailboxId:mail.id,after}),202);
   assert.equal(accepted.index.mailboxId,mail.id);
@@ -292,6 +327,10 @@ test('workerd supports indexed mail IDs, CORS and editable isolated personal mem
   const reloadedHistory=await request(login.alice,'memory/context?query='+encodeURIComponent('报销'));
   assert.ok(reloadedHistory.relatedHistory.some(item=>item.taskId===current.taskId&&item.content.includes('报销')));
   assert.ok(!reloadedHistory.relatedHistory.some(item=>item.messageId===language.source.messageId));
+  await request(login.alice,'history/read',{callerTaskId:recalled.taskId,taskId:prior.taskId,messageId:language.source.messageId},404);
+  const currentSource=current.messages.find(message=>message.role==='user');
+  const afterRestart=await request(login.alice,'history/read',{callerTaskId:recalled.taskId,taskId:current.taskId,messageId:currentSource.messageId});
+  assert.match(afterRestart.result.content,/报销事项/);
   await task('以后用中文回复，回答尽量简洁。');
   assert.ok(!(await request(login.alice,'memory')).memories.some(item=>item.key==='response.language'));
   await request(login.alice,'commands',cmd('memory.upsert',{key:'response.language',value:'中文',expectedVersion:deleted.memory.version}),409);
@@ -299,4 +338,77 @@ test('workerd supports indexed mail IDs, CORS and editable isolated personal mem
   assert.equal(restored.memory.status,'active');
   const reread=await request(login.alice,'mail/read',{mailboxId:mail.id,tool:'mail_read',input:{messageId:id}});
   assert.equal(reread.result.citation.messageId,id);
+});
+
+test('workerd compacts a large paired history with bounded SQL reads and reuses its checkpoint after reconstruction', {timeout:30000}, async t => {
+  const dir=await mkdtemp(join(process.env.MACO_TEST_TMPDIR || tmpdir(),'maco-context-'));
+  let mf;
+  t.after(async()=>{try{await mf?.dispose();}finally{await rm(dir,{recursive:true,force:true});}});
+  const files=(await readdir(source,{recursive:true})).filter(file=>file.endsWith('.mjs'));
+  const modules=Object.fromEntries(await Promise.all(files.map(async path=>[path.split(sep).join('/'),{type:'esm',contents:await readFile(join(source,path),'utf8')}])));
+  modules['context-fixture.mjs']={type:'esm',contents:`
+    import {DurableObject} from 'cloudflare:workers';
+    import {Store} from './store.mjs';
+    import {CompactionService} from './model/compaction.mjs';
+    import {groupMessages} from './model/context.mjs';
+    export class ContextFixture extends DurableObject {
+      constructor(ctx,env) {
+        super(ctx,env);this.store=new Store(ctx.storage);
+        const store=this.store;
+        this.compaction=new CompactionService(store,{async *stream({tools}) {
+          if(tools.length)throw Error('Summary tools must be empty');
+          store.event('fixture.summary_called',{});
+          yield {type:'text_delta',text:'Continue the mail task. Earlier messages are historical notes; consult exact source IDs for details. No email write has been approved or executed.'};
+          yield {type:'usage',inputTokens:100,outputTokens:24};
+          yield {type:'finish',reason:'stop'};
+        }});
+      }
+      async rawState() {
+        const text=JSON.stringify(this.store.messages('long-task',1000));
+        const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));
+        return {count:this.store.one('SELECT COUNT(*) AS n FROM messages').n,
+          digest:[...new Uint8Array(digest)].map(v=>v.toString(16).padStart(2,'0')).join('')};
+      }
+      async fetch(request) {
+        const mode=new URL(request.url).pathname;
+        if(mode==='/seed') {
+          const task={id:'long-task',runId:'run-one',state:'running',version:1,profile:{provider:'openai',model:'fixture'},runStartedAt:Date.now()};
+          this.store.tx(()=>{
+            this.store.saveTask(task);
+            this.store.appendMessage(task,{role:'user',content:'Review the historical mail decisions and continue.'});
+            for(let i=0;i<310;i++)this.store.appendMessage(task,{role:i%2?'user':'assistant',content:'Historical entry '+i+': '+('relevant mail detail '.repeat(5))});
+            this.store.appendMessage(task,{role:'assistant',content:'',toolCalls:[{id:'last-read',name:'mail_read',arguments:{messageId:'mail-source'}}]});
+            this.store.appendMessage(task,{role:'tool',toolName:'mail_read',toolCallId:'last-read',content:JSON.stringify({subject:'Current observation',citation:{messageId:'mail-source'}})});
+          });
+          return Response.json(await this.rawState());
+        }
+        const task=this.store.getTask('long-task');
+        const prepared=await this.compaction.prepare(task,{memoryEpoch:1,signal:new AbortController().signal});
+        groupMessages(prepared.messages.filter(m=>m.role!=='system'));
+        return Response.json({raw:await this.rawState(),compacted:prepared.compacted,truncated:prepared.truncated,
+          checkpoint:this.compaction.view(task.id,1),calls:this.store.events(0,1000).filter(e=>e.type==='fixture.summary_called').length});
+      }
+    }
+    export default {fetch(request,env){return env.CONTEXT.getByName('one').fetch(request)}};
+  `};
+  const options={cf:false,resourcePersistencePath:dir,workers:[{config:{name:'maco-context',compatibilityDate:'2026-11-18',
+    manifest:{mainModule:'context-fixture.mjs',modules},env:{CONTEXT:{type:'durable-object',worker:'maco-context',exportName:'ContextFixture'}},
+    exports:{ContextFixture:{type:'durable-object',storage:'sqlite'}}}}]};
+  mf=new Miniflare(options);
+  const get=async path=>{
+    const response=await mf.dispatchFetch('https://context.test/'+path);
+    assert.equal(response.status,200,await response.clone().text());
+    return response.json();
+  };
+  const original=await get('seed');
+  const first=await get('prepare');
+  assert.ok(first.compacted>0);
+  assert.ok(first.checkpoint.sourceCount>100,'fixture must exercise the SQL binding limit');
+  assert.deepEqual(first.raw,original);
+  await mf.dispose();mf=new Miniflare(options);
+  const restored=await get('prepare');
+  assert.equal(restored.compacted,0);
+  assert.equal(restored.calls,first.calls,'unchanged source must not bill another summary after restart');
+  assert.equal(restored.checkpoint.version,first.checkpoint.version);
+  assert.deepEqual(restored.raw,original);
 });

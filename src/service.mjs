@@ -9,6 +9,8 @@ import { validateTool } from './tool-policy.mjs'
 import { modelCapabilities } from './model/index.mjs'
 import { MemoryService } from './memory/index.mjs'
 import { MailIndexService } from './mail-index/index.mjs'
+import { CompactionService } from './model/compaction.mjs'
+import { HISTORY_TOOLS } from './history/index.mjs'
 import { fingerprint, identifier, requireThat, PROTOCOL_VERSION, checkedVersion } from './protocol.mjs'
 
 export class AgentService {
@@ -22,6 +24,12 @@ export class AgentService {
       requireThat(Number.isSafeInteger(n) && n >= min && n <= max,'invalid_capacity_configuration',500)
       return n
     }
+    const maxInputBytes = limit(env.CONTEXT_INPUT_BYTES,65536,16384,131072)
+    this.compaction = new CompactionService(this.store,{
+      stream:model?.stream,maxInputBytes,
+      retainBytes:Math.min(12000,Math.floor(maxInputBytes*0.2)),
+      maxSummaryBytes:Math.min(6000,Math.floor(maxInputBytes*0.1))
+    })
     this.mail = new MailCommandExecutor(this.store,this.connections,{
       ...mail,maxPending:limit(env.MAX_PENDING_OPERATIONS,256,30,2048),
       resolveInput:(mailboxId,input) => this.index.resolveInput(mailboxId,input),
@@ -30,7 +38,7 @@ export class AgentService {
         mail?.onSettled?.(op)
       }})
     this.harness = new Harness(this.store,this.connections,this.mail,{
-      ...model,memory:this.memory,maxOpenTasks:limit(env.MAX_OPEN_TASKS,32,1,256),
+      ...model,memory:this.memory,compaction:this.compaction,maxOpenTasks:limit(env.MAX_OPEN_TASKS,32,1,256),
       read:(name,input,ctx) => this.readProvider(name,input,ctx,model?.read || readMailTool)})
     this.host = new ExecutionHost(ctx,this.store,this.harness,this.mail,{maintenance:[
       {name:'memory',idleOnly:true,recover:() => this.memory.recover(),
@@ -182,6 +190,22 @@ export class AgentService {
     validateTool(tool.inputSchema,body.input ?? {})
     const result = await withDeadline(30000,null,signal => this.readProvider(body.tool,body.input || {},{...ctx,signal}))
     this.mail.metadata(body.mailboxId,meta.epoch)
+    return {result}
+  }
+  queryHistory(toolName,body) {
+    const {callerTaskId,...input} = body
+    const task = this.store.getTask(identifier(callerTaskId,'task_id'))
+    // The JWT already selected this user's DO. Derive mailbox scope from an
+    // existing task and live connection; neither tool nor HTTP input picks owner.
+    this.mail.metadata(task.mailboxId)
+    const tool = HISTORY_TOOLS.find(tool => tool.name === toolName)
+    requireThat(tool,'history_tool_not_allowed',403)
+    validateTool(tool.inputSchema,input)
+    const scope = {callerTaskId:task.id,mailboxId:task.mailboxId,
+      beforeN:this.store.one('SELECT COALESCE(MAX(n),0)+1 AS n FROM messages WHERE task=?',task.id).n}
+    const started = Date.now()
+    const result = toolName === 'history_search' ? this.memory.history.search(input,scope) : this.memory.history.read(input,scope)
+    this.store.timing('history_tool',Date.now()-started)
     return {result}
   }
   capabilities(id,model) {

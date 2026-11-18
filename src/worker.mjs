@@ -173,6 +173,8 @@ export class MacoAgent extends DurableObject {
         const body = await payload(request)
         if (path === '/v1/commands') return json(await service.command(body),202)
         if (path === '/v1/mail/read') return json(await service.read(body))
+        if (path === '/v1/history/search') return json(service.queryHistory('history_search',body))
+        if (path === '/v1/history/read') return json(service.queryHistory('history_read',body))
         let connection
         switch (path) {
           case '/v1/connections/model': connection = await vault.putModel(body); break

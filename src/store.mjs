@@ -5,6 +5,7 @@ const schema = [
   'CREATE INDEX IF NOT EXISTS runnable_tasks ON tasks(state, due)',
   'CREATE TABLE IF NOT EXISTS messages (n INTEGER PRIMARY KEY, task TEXT NOT NULL, data TEXT NOT NULL)',
   'CREATE INDEX IF NOT EXISTS task_messages ON messages(task, n)',
+  "CREATE INDEX IF NOT EXISTS task_message_ids ON messages(task, json_extract(data,'$.messageId'))",
   'CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, digest TEXT NOT NULL, result TEXT NOT NULL)',
   'CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL)',
   'CREATE TABLE IF NOT EXISTS timings (n INTEGER PRIMARY KEY, metric TEXT NOT NULL, ms REAL NOT NULL)',
@@ -18,8 +19,8 @@ const schema = [
 ]
 
 export function taskView(t) {
-  const {id, runId, profile, mailboxId, state, version, priority, createdAt, updatedAt, error, waitingOperationId, timeZone} = t
-  return {taskId:id, runId, modelProfile:profile, mailboxId, state, taskVersion:version, priority, createdAt, updatedAt, error, waitingOperationId, timeZone}
+  const {id, runId, profile, mailboxId, state, version, priority, createdAt, updatedAt, error, waitingOperationId, timeZone, context} = t
+  return {taskId:id, runId, modelProfile:profile, mailboxId, state, taskVersion:version, priority, createdAt, updatedAt, error, waitingOperationId, timeZone, context}
 }
 
 export function operationView(op) {
@@ -29,7 +30,7 @@ export function operationView(op) {
 }
 
 export function publicMessage(message) {
-  const {providerState, ...rest} = message
+  const {providerState, historyEpoch, ...rest} = message
   return rest
 }
 
@@ -94,7 +95,7 @@ export class Store {
     if (announce) this.event('task.updated', taskView(t))
   }
   appendMessage(t, message) {
-    const value = {messageId:crypto.randomUUID(), runId:t.runId, ...message}
+    const value = {messageId:crypto.randomUUID(), runId:t.runId, createdAt:Date.now(), ...message}
     this.rows('INSERT INTO messages(task,data) VALUES (?,?)', t.id, JSON.stringify(value))
     this.event('message.committed', {taskId:t.id, message:publicMessage(value)})
     return value

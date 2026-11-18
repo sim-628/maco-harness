@@ -2,7 +2,8 @@ import {requireThat, checkedVersion, errorCode} from '../protocol.mjs'
 import {streamStep} from '../model/index.mjs'
 import {validateTool} from '../tool-policy.mjs'
 import {withDeadline} from '../deadline.mjs'
-import {explicitPreferences, extractionPrompt, mayContainPreference, preferenceTool, safePersonalText, searchTerms} from './extract.mjs'
+import {explicitPreferences, extractionPrompt, mayContainPreference, preferenceTool, safePersonalText} from './extract.mjs'
+import {HistoryService} from '../history/index.mjs'
 
 const DAY = 86_400_000
 const schema = [
@@ -11,10 +12,6 @@ const schema = [
     version INTEGER NOT NULL, source TEXT NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS memory_state (singleton INTEGER PRIMARY KEY, data TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS memory_observed (messageId TEXT PRIMARY KEY, n INTEGER NOT NULL)`,
-  `CREATE TABLE IF NOT EXISTS memory_history (
-    n INTEGER PRIMARY KEY, messageId TEXT UNIQUE NOT NULL, taskId TEXT NOT NULL,
-    role TEXT NOT NULL, content TEXT NOT NULL, tokens TEXT NOT NULL)`,
-  `CREATE VIRTUAL TABLE IF NOT EXISTS memory_history_fts USING fts5(tokens, content='memory_history', content_rowid='n')`,
   `CREATE TABLE IF NOT EXISTS memory_excluded_sources (messageId TEXT PRIMARY KEY)`,
   `CREATE TABLE IF NOT EXISTS memory_proposals (
     id TEXT PRIMARY KEY, sourceMessageId TEXT NOT NULL, key TEXT NOT NULL, status TEXT NOT NULL,
@@ -54,6 +51,7 @@ export class MemoryService {
         enabled:true, extractionMode:'explicit', version:1, epoch:1, historyCursor:0, historyFloor:0, forgetBeforeN:0
       }))
     })
+    this.history=new HistoryService(store,{state:()=>this.state(),saveState:state=>this.saveState(state)})
   }
   state() { return JSON.parse(this.store.one('SELECT data FROM memory_state WHERE singleton=1').data) }
   saveState(state) { this.store.rows('UPDATE memory_state SET data=? WHERE singleton=1',JSON.stringify(state)) }
@@ -139,27 +137,8 @@ export class MemoryService {
     requireThat(['user','assistant'].includes(message.role) && typeof message.content === 'string','invalid_memory_source')
     return {...row,taskId,message}
   }
-  indexSource({n,taskId,message}) {
-    if (this.store.one('SELECT n FROM memory_history WHERE n=?',n)) return
-    if (!message.messageId || !message.content || !['user','assistant'].includes(message.role)) return
-    const content=message.content.slice(0,12000)
-    const tokens=searchTerms(content,1024).join(' ')
-    this.store.rows('INSERT INTO memory_history VALUES (?,?,?,?,?,?)',n,message.messageId,taskId,message.role,content,tokens)
-    this.store.rows('INSERT INTO memory_history_fts(rowid,tokens) VALUES (?,?)',n,tokens)
-  }
-  syncHistory(limit=256) {
-    const state=this.state()
-    if (!state.enabled) return {indexedThrough:state.historyCursor,hasMore:false}
-    requireThat(Number.isSafeInteger(limit) && limit>0 && limit<=512,'invalid_memory_limit')
-    return this.store.tx(() => {
-      const rows=this.store.rows('SELECT n,task,data FROM messages WHERE n>? ORDER BY n LIMIT ?',Math.max(state.historyCursor,state.historyFloor),limit)
-      for (const row of rows) this.indexSource({n:row.n,taskId:row.task,message:JSON.parse(row.data)})
-      state.historyCursor=rows.at(-1)?.n ?? state.historyCursor
-      this.saveState(state)
-      const head=this.store.one('SELECT COALESCE(MAX(n),0) AS n FROM messages').n
-      return {indexedThrough:state.historyCursor,hasMore:state.historyCursor<head}
-    })
-  }
+  indexSource(source) { return this.history.indexSource(source) }
+  syncHistory(limit=256) { return this.history.sync(limit) }
   observe(taskId,messageId,binding = {}) {
     const source=this.source(taskId,messageId)
     const state=this.state()
@@ -191,39 +170,32 @@ export class MemoryService {
       return {captured}
     })
   }
-  searchHistory(query,{excludeTaskId,limit=4} = {}) {
-    requireThat(typeof query==='string' && query.length<=16000,'invalid_memory_query')
-    requireThat(Number.isSafeInteger(limit) && limit>0 && limit<=10,'invalid_memory_limit')
-    const coverage=this.syncHistory()
-    if (!this.state().enabled) return {results:[],coverage}
-    const terms=searchTerms(query,16)
-    if (!terms.length) return {results:[],coverage}
-    const match=terms.map(t=>'"'+t.replaceAll('"','""')+'"').join(' OR ')
-    const rows=this.store.rows(`SELECT h.n,h.taskId,h.messageId,h.role,h.content,bm25(memory_history_fts) AS rank
-      FROM memory_history_fts JOIN memory_history h ON h.n=memory_history_fts.rowid
-      WHERE memory_history_fts MATCH ? AND h.taskId!=?
-      AND NOT EXISTS(SELECT 1 FROM memory_excluded_sources x WHERE x.messageId=h.messageId)
-      ORDER BY rank,h.n DESC LIMIT ?`,match,excludeTaskId || '',limit)
-    return {results:rows.map(({n,rank,...row})=>({...row,content:row.content.slice(0,1200),contentTruncated:row.content.length>1200})),coverage}
-  }
-  context(taskId,{query,maxBytes=6000} = {}) {
+  searchHistory(query,options={}) { return this.history.searchHistory(query,options) }
+  context(taskId,{query,maxBytes=6000,mailboxId,beforeN} = {}) {
     requireThat(Number.isSafeInteger(maxBytes) && maxBytes>=256 && maxBytes<=16000,'invalid_memory_budget')
     if (!this.state().enabled) return {facts:[],preferences:[],relatedHistory:[],coverage:{enabled:false}}
     if (query===undefined) {
       const row=this.store.one("SELECT data FROM messages WHERE task=? AND json_extract(data,'$.role')='user' ORDER BY n DESC LIMIT 1",taskId)
       query=row ? JSON.parse(row.data).content : ''
     }
-    const {results,coverage}=this.searchHistory(query,{excludeTaskId:taskId})
-    const value={facts:[],preferences:[],relatedHistory:[],coverage:{...coverage,enabled:true}}
-    const include=(list,item)=>{
+    const {results,coverage,capped}=this.searchHistory(query,{excludeTaskId:taskId,mailboxId,beforeN})
+    const value={facts:[],preferences:[],relatedHistory:[],coverage:{...coverage,enabled:true,capped}}
+    const include=(list,item,budget=maxBytes)=>{
       list.push(item)
-      if (utf8.encode(JSON.stringify(value)).length>maxBytes) list.pop()
+      if (utf8.encode(JSON.stringify(value)).length>budget) {list.pop();return false}
+      return true
     }
+    // Give a useful historical hit room even when the user has many preferences.
+    // Unused history space is released back to facts/preferences below.
+    const historyReserve=results.length?Math.min(2000,Math.floor(maxBytes*0.35)):0
+    const deferred=[]
     for (const row of this.store.rows("SELECT * FROM personal_memory WHERE status='active' ORDER BY (kind='fact') DESC,updatedAt DESC LIMIT 40")) {
       const {key,kind,value:text,version,source}=view(row)
-      include(kind==='fact'?value.facts:value.preferences,{key,value:text,version,source})
+      const list=kind==='fact'?value.facts:value.preferences,item={key,value:text,version,source}
+      if(!include(list,item,maxBytes-historyReserve)) deferred.push([list,item])
     }
     for (const result of results) include(value.relatedHistory,result)
+    for (const [list,item] of deferred) include(list,item)
     return value
   }
   proposals() { return this.list().proposals }
