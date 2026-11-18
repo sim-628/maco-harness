@@ -1,0 +1,24 @@
+# A Supabase project using asymmetric JWT signing keys.
+SUPABASE_URL=
+JWT_AUDIENCE=authenticated
+
+# Exact browser origins, including ports; native apps need no Origin.
+ALLOWED_ORIGINS=http://localhost:3000
+
+# Optional extra OpenAI-compatible providers. Exact trusted DNS hosts only.
+# Built-in OpenAI, Anthropic and DeepSeek endpoints do not require this variable.
+MODEL_PROVIDER_HOSTS=
+
+# Per-user admission bounds; execution concurrency remains 2 tasks / 4 writes / 1 maintenance job.
+MAX_OPEN_TASKS=32
+MAX_PENDING_OPERATIONS=256
+
+# Generate once per deployment with openssl rand -base64 32. Retain the key across restarts.
+CONNECTION_ENCRYPTION_KEY=
+
+# Register the actual client callback URL with each enabled mail provider.
+OAUTH_REDIRECT_URI=
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+MICROSOFT_CLIENT_ID=
+MICROSOFT_CLIENT_SECRET=

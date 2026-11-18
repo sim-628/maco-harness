@@ -1,0 +1,34 @@
+name: Verify Worker
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - name: Unit and service tests
+        run: npm test
+      - name: Workerd persistence and isolation tests
+        run: npm run test:worker
+      - name: Validate deployment bundle
+        run: npm run check:worker
+        env:
+          WRANGLER_SEND_METRICS: 'false'
