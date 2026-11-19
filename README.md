@@ -105,6 +105,7 @@ npm run check:worker
 - [Cloudflare 部署](docs/cloudflare-deploy.md)
 - [旧 Maco 迁移](docs/migration.md)
 - [完整后端迁移目标与能力验收](docs/full-backend-migration.md)（设计方案，尚未实现）
+- [附件理解与复杂任务执行策略](docs/attachments-and-managed-execution.md)（端侧分析、Cloudflare 解析与托管 Agent 委派，尚未实现）
 - [Swift 客户端示例](examples/MacoClient.swift)
 - [已有 Notion 策略](https://app.notion.com/p/41cfdd4befa181379301f86bebeabf75)
 

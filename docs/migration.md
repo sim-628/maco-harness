@@ -1,6 +1,8 @@
 # 从旧 Maco / OpenAI 托管 Agent 迁移
 
-目标是把 Agent 循环、工具约束、邮箱操作和持久状态迁入本仓库的 Cloudflare Worker / 每用户 Durable Object，移除对托管 Agent、Codex 沙盒和设备执行邮件修改的依赖。原 App 可以继续保留一个个人助理入口；执行层使用多个独立 Task 和同一用户事件流。
+目标是把常规 Agent 循环、工具约束、邮箱操作和持久状态迁入本仓库的 Cloudflare Worker / 每用户 Durable Object。日常路径使用自有 Harness，邮件修改统一在云端执行。原 App 可以继续保留一个个人助理入口；执行层使用多个独立 Task 和同一用户事件流。
+
+2026-11-19 更新的目标允许复杂任务按需委派托管 Agent API，并明确邮件摘要/分类由端侧 AI 完成；见[附件理解与复杂任务执行策略](attachments-and-managed-execution.md)。本文下述独立 v0.3 的接口与能力仍不包含该委派实现。
 
 本仓库是新后端，**尚未替你完成 maco-mail 客户端切流，也没有旧会话、凭据或任务的自动导入接口**。参数与响应以[客户端协议](protocol.md)为准，环境配置见[Cloudflare 部署](cloudflare-deploy.md)。
 
