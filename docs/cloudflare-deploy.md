@@ -2,13 +2,27 @@
 
 本仓库包含 Worker、SQLite Durable Object 绑定、迁移声明、锁定依赖、测试及部署脚本。以下操作在你的 Cloudflare、Supabase、Google / Microsoft 项目中完成；仓库发布不代表这些账号已完成配置或生产部署。
 
+## 当前部署边界
+
+**本教程用于独立 `maco-harness` Worker 的测试部署，不是旧 `maco-agent-cloud` 的生产切换步骤。** 当前运行版本为 v0.3；完整后端与附件/托管执行策略仍有待实现部分。
+
+| 项目 | 当前结论 |
+| --- | --- |
+| 构建与本地运行时检查 | 可执行 `npm run check`，包含单元/服务测试、workerd 集成测试和部署 dry-run；通过不等于真实账户验收 |
+| 现有 App 直接改后端 URL | 不兼容：旧 `/v1/chat` 合约尚未适配，新协议使用 `/v1/commands`、JSON `/v1/events` 与 WebSocket `/v1/socket` |
+| 旧账号数据、聊天与 OAuth 授权继承 | 尚未实现；同一 Supabase 用户身份不会把新旧 DO namespace 自动合并 |
+| 完整附件与复杂任务能力 | 当前无通用 PDF/Office 解析、R2 资产层或托管子任务执行器；相关文档为目标方案 |
+| 旧生产 Worker 替换 | 未就绪；需要完成[完整迁移与验收](full-backend-migration.md)后再切换 |
+
+新配置是 `AGENTS → MacoAgent`，旧生产是 `ACCOUNTS → AgentAccount`，并绑定 R2 `maco-chat-private`。保持两套服务和测试数据隔离；修改 Worker 名称、DO 类名或绑定名不能完成业务和数据迁移。不要给当前 v0.3 绑定旧生产 namespace 或资产桶来尝试补齐功能。
+
 ## 1. 连接 GitHub
 
 在 Cloudflare Workers 的 Git 集成中选择 [sim-628/maco-harness](https://github.com/sim-628/maco-harness)，授权该仓库访问。
 
 | 项目 | 配置 |
 | --- | --- |
-| 生产分支 | `main` |
+| Cloudflare 的“生产分支”字段 | `main`，指这个独立测试 Worker 的构建分支，不代表旧 Maco 生产切流 |
 | 根目录 | `/` |
 | Worker 名称 | `maco-harness` |
 | Build command | `npm ci && npm test && npm run test:worker` |

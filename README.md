@@ -1,16 +1,18 @@
 # Maco Harness
 
+> **部署状态：当前 v0.3 仅适合独立测试与集成验证，尚不能替换现有 Maco 生产后端。** 下面的 Git 集成部署会创建/更新独立的 `maco-harness` Worker。不要将它改名覆盖 `maco-agent-cloud`，也不要把现有 App 切到新地址。完整后端、附件解析及托管复杂子任务仍按[迁移方案](docs/full-backend-migration.md)逐项实现；合并策略文档不会增加运行能力。
+
 部署在 Cloudflare 的邮件 Agent 后端。每个登录账号拥有一个 Durable Object 和 SQLite 数据库，承载多个独立任务、统一事件流、邮箱操作、邮件索引和个人记忆。iOS、macOS、Web 可以展示同一个个人助理并同步执行结果；模型只收到当前任务需要的上下文。
 
 运行路径为 **用户 → Cloudflare Worker / 用户 DO → 模型或 Gmail / Microsoft Graph → Cloudflare → 用户**。无需 Codex 沙盒、容器、单独的 Agent 服务或向量数据库。Supabase 承担现有 App 的身份认证，Worker 直接校验 JWT；模型与邮箱请求不经 Supabase 转发。
 
-## 直接连接 Cloudflare
+## 连接 Cloudflare 进行独立测试
 
 在 Cloudflare Workers 中连接 [sim-628/maco-harness](https://github.com/sim-628/maco-harness)，填写：
 
 | 设置 | 值 |
 | --- | --- |
-| 分支 | `main` |
+| 分支 | `main`；仅用于这个独立测试 Worker |
 | 根目录 | `/` |
 | Worker 名称 | `maco-harness`，与 `wrangler.jsonc` 一致 |
 | Build command | `npm ci && npm test && npm run test:worker` |
