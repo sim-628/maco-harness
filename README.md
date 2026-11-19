@@ -18,6 +18,8 @@
 
 `wrangler.jsonc` 声明 `AGENTS → MacoAgent`、`NOTIFICATIONS → NotificationRegistry`、自动创建的 `ASSETS` R2 桶和 `AI` binding。保留已有 `v1` / `v2` migration，部署到新的资源。基础运行时配置是 `SUPABASE_URL` 与 `CONNECTION_ENCRYPTION_KEY`；浏览器来源、邮箱 OAuth、MCP、OCR、托管执行与推送按需配置。构建变量与 Worker 运行时 Secrets 是两套设置。
 
+新 Worker 不需要 `SUPABASE_SERVICE_ROLE_KEY`。运营方凭据可用普通 Worker Secret 或 Cloudflare Secrets Store 原生 binding，用户自己的大量 key 继续用加密连接 ID；主加密密钥保持固定。具体填写方法、稳定引用和 Git 部署规则见[环境变量与 Secrets Store](docs/environment-and-secrets.md)。
+
 详细配置、部署验收与可选功能条件见 [Cloudflare 部署](docs/cloudflare-deploy.md)。GitHub 发布和本地测试不表示已在你的 Cloudflare、邮箱或 Apple 账户完成部署与联调。
 
 ## 已实现的能力
@@ -101,6 +103,7 @@ npm run check
 App 后续必须接入新命令 / 事件协议、连接 ID 与版本检查，并停用旧云端执行器和设备直写队列后再切流。旧数据与 OAuth 授权没有自动迁移器，旧 Graph watch 也不会被新 Worker 自动接管。Supabase Auth、网站 / passkey 等原系统职能仍需单独保留或迁移。
 
 - [Cloudflare 部署与真实验收](docs/cloudflare-deploy.md)
+- [环境变量、凭据索引与 Secrets Store](docs/environment-and-secrets.md)
 - [客户端协议与全部路由](docs/protocol.md)
 - [旧 Maco 迁移原则](docs/migration.md)
 - [完整后端迁移目标与验收清单](docs/full-backend-migration.md)

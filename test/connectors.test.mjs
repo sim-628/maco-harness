@@ -201,7 +201,7 @@ function oauthConfig(overrides={}) {
     metadataUrls:[issuer+'/.well-known/oauth-authorization-server'],allowedEndpoints:[issuer+'/authorize',issuer+'/token',issuer+'/register'],
     clientId:'maco-client',scopes:['notes:read','notes:write'],...overrides}})
 }
-function oauthServer({refresh,metadata={},grant={}}={}) {
+function oauthServer({refresh,metadata={},grant={},registration={}}={}) {
   const calls=[]
   const fetcher=async(url,options)=>{
     calls.push({url,options})
@@ -210,7 +210,7 @@ function oauthServer({refresh,metadata={},grant={}}={}) {
     if(url.includes('oauth-authorization-server'))return Response.json({issuer,authorization_endpoint:issuer+'/authorize',token_endpoint:issuer+'/token',
       registration_endpoint:issuer+'/register',code_challenge_methods_supported:['S256'],token_endpoint_auth_methods_supported:['none'],
       authorization_response_iss_parameter_supported:true,...metadata})
-    if(url.endsWith('/register'))return Response.json({client_id:'registered-client',token_endpoint_auth_method:'none'})
+    if(url.endsWith('/register'))return Response.json({client_id:'registered-client',token_endpoint_auth_method:'none',...registration})
     assert.equal(url,issuer+'/token')
     assert.equal(options.body.get('resource'),endpoint)
     if(options.body.get('grant_type')==='refresh_token' && refresh)return refresh(options)
@@ -250,6 +250,145 @@ test('OAuth metadata cannot select an unlisted token destination; dynamic regist
   assert.equal(new URL(start.authorizationUrl).searchParams.get('client_id'),'registered-client')
   const registration=remote.calls.find(call=>call.url.endsWith('/register'))
   assert.equal(JSON.parse(registration.options.body).application_type,'web')
+})
+
+test('configured OAuth clients resolve rotated strings or bindings without persisting the application secret',async t=>{
+  for(const source of ['string','binding'])for(const authMethod of ['client_secret_post','client_secret_basic'])await t.test(source+' '+authMethod,async t=>{
+    let value='configured-secret-A',reads=0
+    const env=oauthConfig({clientSecretEnv:'NOTES_CLIENT_SECRET',tokenEndpointAuthMethod:authMethod})
+    env.NOTES_CLIENT_SECRET=source==='binding'?{get:async()=>{reads++;return value}}:value
+    const rotate=next=>{value=next;if(source==='string')env.NOTES_CLIENT_SECRET=next}
+    const remote=oauthServer({metadata:{token_endpoint_auth_methods_supported:[authMethod]},grant:{expires_in:1}})
+    const {service,store}=fixture(t,{env,fetcher:remote.fetcher})
+    const start=await service.beginOAuth({serverId:'notes'})
+    const flow=await service.cipher.open(['connector-oauth',start.state],store.one('SELECT sealed FROM connector_oauth WHERE state=?',start.state).sealed)
+    assert.equal(reads,0)
+    assert.deepEqual(flow.client,{id:'maco-client',authMethod,source:'configured',secretEnv:'NOTES_CLIENT_SECRET'})
+    rotate('configured-secret-B')
+    const connection=await service.completeOAuth({state:start.state,code:'code',iss:issuer})
+    const exchange=remote.calls.find(call=>call.url.endsWith('/token')).options
+    const sentSecret=options=>authMethod==='client_secret_post'?options.body.get('client_secret'):
+      decodeURIComponent(Buffer.from(options.headers.Authorization.slice(6),'base64').toString().split(':')[1])
+    assert.equal(sentSecret(exchange),'configured-secret-B')
+    rotate('configured-secret-C')
+    await service.credential(connection.id,connection.epoch)
+    const refresh=remote.calls.filter(call=>call.url.endsWith('/token')).at(-1).options
+    assert.equal(refresh.body.get('grant_type'),'refresh_token')
+    assert.equal(sentSecret(refresh),'configured-secret-C')
+    const persisted=await service.cipher.open(['connector','notes',connection.id],store.one('SELECT sealed FROM connector_connections WHERE id=?',connection.id).sealed)
+    assert.deepEqual(persisted.oauth.client,flow.client)
+    assert.doesNotMatch(JSON.stringify({flow,persisted}),/configured-secret-/)
+    assert.equal(reads,source==='binding'?2:0)
+  })
+})
+
+test('a failed OAuth secret lookup preserves callback state and refresh credentials for a safe retry',async t=>{
+  let unavailable=true
+  const env=oauthConfig({clientSecretEnv:'NOTES_CLIENT_SECRET'})
+  env.NOTES_CLIENT_SECRET={get:async()=>{if(unavailable)throw Error('private upstream binding failure');return 'current-client-secret'}}
+  const remote=oauthServer({metadata:{token_endpoint_auth_methods_supported:['client_secret_post']},grant:{expires_in:1}})
+  const {service,store}=fixture(t,{env,fetcher:remote.fetcher})
+  const start=await service.beginOAuth({serverId:'notes'})
+  const retryable=error=>{
+    assert.equal(error.code,'connector_oauth_client_secret_unavailable')
+    assert.equal(error.status,503);assert.equal(error.beforeDispatch,true)
+    assert.doesNotMatch(error.message,/private upstream/)
+    return true
+  }
+  await assert.rejects(service.completeOAuth({state:start.state,code:'code',iss:issuer}),retryable)
+  assert.equal(remote.calls.filter(call=>call.url.endsWith('/token')).length,0)
+  assert.ok(store.one('SELECT state FROM connector_oauth WHERE state=?',start.state))
+  unavailable=false
+  const connection=await service.completeOAuth({state:start.state,code:'code',iss:issuer})
+  const before=store.one('SELECT sealed,generation FROM connector_connections WHERE id=?',connection.id)
+  unavailable=true
+  await assert.rejects(service.credential(connection.id,connection.epoch),retryable)
+  assert.equal(remote.calls.filter(call=>call.url.endsWith('/token')).length,1)
+  const after=store.one('SELECT * FROM connector_connections WHERE id=?',connection.id)
+  assert.equal(after.status,'active');assert.equal(after.refreshing,null)
+  assert.equal(after.sealed,before.sealed);assert.equal(after.generation,before.generation)
+  unavailable=false
+  await service.credential(connection.id,connection.epoch)
+  assert.equal(remote.calls.filter(call=>call.url.endsWith('/token')).length,2)
+  assert.equal(service.get(connection.id).status,'active')
+})
+
+test('revoking a request session during an OAuth secret lookup prevents code exchange and persistence',async t=>{
+  let started,release,allowed=true
+  const began=new Promise(resolve=>{started=resolve}),gate=new Promise(resolve=>{release=resolve})
+  const env=oauthConfig({clientSecretEnv:'NOTES_CLIENT_SECRET'})
+  env.NOTES_CLIENT_SECRET={get:async()=>{started();await gate;return 'private-secret'}}
+  const remote=oauthServer({metadata:{token_endpoint_auth_methods_supported:['client_secret_post']}})
+  const {service,store}=fixture(t,{env,fetcher:remote.fetcher})
+  const start=await service.beginOAuth({serverId:'notes'})
+  const assertAuthorized=()=>{if(!allowed)throw Object.assign(Error('revoked session'),{code:'session_revoked'})}
+  const rejected=assert.rejects(service.completeOAuth({state:start.state,code:'code',iss:issuer},{assertAuthorized}),{code:'session_revoked'})
+  await began;allowed=false;release();await rejected
+  assert.equal(remote.calls.filter(call=>call.url.endsWith('/token')).length,0)
+  assert.equal(service.list().length,0)
+  assert.ok(store.one('SELECT state FROM connector_oauth WHERE state=?',start.state))
+})
+
+test('revoking a connector during a slow secret lookup prevents refresh dispatch without an uncertain-outcome marker',async t=>{
+  let started,release,blocked=false
+  const began=new Promise(resolve=>{started=resolve}),gate=new Promise(resolve=>{release=resolve})
+  const env=oauthConfig({clientSecretEnv:'NOTES_CLIENT_SECRET'})
+  env.NOTES_CLIENT_SECRET={get:async()=>{if(blocked){started();await gate}return 'private-secret'}}
+  const remote=oauthServer({metadata:{token_endpoint_auth_methods_supported:['client_secret_post']},grant:{expires_in:1}})
+  const {service,store}=fixture(t,{env,fetcher:remote.fetcher})
+  const start=await service.beginOAuth({serverId:'notes'}),connection=await service.completeOAuth({state:start.state,code:'code',iss:issuer})
+  blocked=true
+  const rejected=assert.rejects(service.credential(connection.id,connection.epoch),{code:'connector_changed'})
+  await began
+  assert.equal(store.one('SELECT refreshing FROM connector_connections WHERE id=?',connection.id).refreshing,null)
+  service.revoke(connection.id,connection.epoch);release();await rejected
+  assert.equal(remote.calls.filter(call=>call.url.endsWith('/token')).length,1)
+  const after=store.one('SELECT * FROM connector_connections WHERE id=?',connection.id)
+  assert.equal(after.status,'revoked');assert.equal(after.sealed,null);assert.equal(after.refreshing,null)
+})
+
+test('legacy configured grants migrate to the current operator reference only for the same client and issuer',async t=>{
+  for(const change of ['none','client','issuer','resource'])await t.test(change,async t=>{
+    let reads=0
+    const env=oauthConfig({clientSecretEnv:'NOTES_CLIENT_SECRET'})
+    env.NOTES_CLIENT_SECRET={get:async()=>{reads++;return 'current-operator-secret'}}
+    const remote=oauthServer(),{service,store}=fixture(t,{env,fetcher:remote.fetcher})
+    const secret={kind:'oauth',accessToken:'expired-access',refreshToken:'legacy-refresh',expiresAt:1,scopes:['notes:read','notes:write'],oauth:{
+      issuer:change==='issuer'?'https://old-auth.example.com':issuer,resource:change==='resource'?'https://old-mcp.example.com/mcp':endpoint,
+      tokenEndpoint:issuer+'/token',client:{id:change==='client'?'old-client':'maco-client',authMethod:'client_secret_post',secret:'legacy-embedded-secret'}}}
+    const connection=await service.saveCredential({id:crypto.randomUUID(),serverId:'notes',secret})
+    if(change==='none') {
+      await service.credential(connection.id,connection.epoch)
+      assert.equal(reads,1)
+      assert.equal(remote.calls[0].options.body.get('client_secret'),'current-operator-secret')
+      const persisted=await service.cipher.open(['connector','notes',connection.id],store.one('SELECT sealed FROM connector_connections WHERE id=?',connection.id).sealed)
+      assert.deepEqual(persisted.oauth.client,{id:'maco-client',authMethod:'client_secret_post',source:'configured',secretEnv:'NOTES_CLIENT_SECRET'})
+      assert.doesNotMatch(JSON.stringify(persisted),/legacy-embedded-secret|current-operator-secret/)
+    } else {
+      const code=change==='client'?'connector_reauthorization_required':change==='issuer'?'connector_oauth_issuer_mismatch':'connector_oauth_resource_mismatch'
+      await assert.rejects(service.credential(connection.id,connection.epoch),{code})
+      assert.equal(reads,0);assert.equal(remote.calls.length,0)
+      assert.equal(service.get(connection.id).status,'active')
+      assert.equal(store.one('SELECT refreshing FROM connector_connections WHERE id=?',connection.id).refreshing,null)
+    }
+  })
+})
+
+test('dynamically registered client secrets stay bound to their grant when an operator adds a configured client',async t=>{
+  const remote=oauthServer({metadata:{token_endpoint_auth_methods_supported:['client_secret_post']},grant:{expires_in:1},
+    registration:{token_endpoint_auth_method:'client_secret_post',client_secret:'registered-client-secret'}})
+  const {service,store,env}=fixture(t,{env:oauthConfig({clientId:undefined,allowDynamicRegistration:true}),fetcher:remote.fetcher})
+  const start=await service.beginOAuth({serverId:'notes'}),connection=await service.completeOAuth({state:start.state,code:'code',iss:issuer})
+  assert.equal(remote.calls.find(call=>call.url.endsWith('/token')).options.body.get('client_secret'),'registered-client-secret')
+  const nextEnv={...env,...oauthConfig({clientId:'different-operator-client',clientSecretEnv:'NOTES_CLIENT_SECRET',allowDynamicRegistration:true})}
+  nextEnv.NOTES_CLIENT_SECRET={get:()=>{throw Error('must not replace the registered client secret')}}
+  const reconstructed=new ConnectorService(store,nextEnv,{fetcher:remote.fetcher})
+  const credential=await reconstructed.credential(connection.id,connection.epoch)
+  const refresh=remote.calls.filter(call=>call.url.endsWith('/token')).at(-1).options
+  assert.equal(refresh.body.get('client_id'),'registered-client')
+  assert.equal(refresh.body.get('client_secret'),'registered-client-secret')
+  assert.equal(credential.oauth.client.source,'dynamic')
+  assert.equal(credential.oauth.client.secretEnv,undefined)
 })
 
 test('one durable refresh owner serves concurrent calls; revocation wins over a late token rotation',async t=>{

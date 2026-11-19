@@ -3,6 +3,7 @@ import { withDeadline } from '../deadline.mjs'
 import { downloadAttachment } from '../mail/read.mjs'
 import { boundedBytes, check, encoder, fail, hex, safeName, sha256, textPrefix, validateMime } from './io.mjs'
 import { parserFor, parseDocument } from './parsers.mjs'
+import { hasSecret } from '../secrets.mjs'
 
 const MiB = 1024*1024
 const tables = [
@@ -78,7 +79,7 @@ export class AssetService {
     return {enabled:Boolean(this.env.ASSETS),limits:{maxBytes:this.maxBytes,maxRefs:this.maxRefs,
       maxParsedBytes:this.maxParsedBytes,maxFiles:this.maxFiles,maxAccountBytes:this.maxAccountBytes},
       parsers:{local:true,cloudflare:typeof this.env.AI?.toMarkdown === 'function',
-        deepseek:typeof this.env.DEEPSEEK_OCR_API_KEY === 'string' && this.env.DEEPSEEK_OCR_API_KEY.length > 0},
+        deepseek:hasSecret(this.env.DEEPSEEK_OCR_API_KEY)},
       automaticOCR:this.env.ASSET_AUTO_OCR === 'deepseek' ? 'deepseek' : null}
   }
   cleanupStatus() {
@@ -491,7 +492,9 @@ export class AssetService {
     }
     for (const {data} of this.store.rows("SELECT data FROM maco_asset_parses WHERE state='running'")) {
       const job = JSON.parse(data)
-      if (job.options.parser === 'deepseek') { job.state = 'unknown'; job.error = 'ocr_completion_unknown' }
+      // Older running records lack this flag and must stay conservative. A
+      // current attempt waiting for a secret has not dispatched billable OCR.
+      if (job.options.parser === 'deepseek' && job.dispatched !== false) { job.state = 'unknown'; job.error = 'ocr_completion_unknown' }
       else if (job.attempts < 3) { job.state = 'queued'; job.due = 0; job.error = 'parse_interrupted' }
       else { job.state = 'failed'; job.error = 'parse_interrupted' }
       this.#saveJob(job)
@@ -586,7 +589,7 @@ export class AssetService {
     const controller = new AbortController()
     this.parsers.set(job.id,controller)
     const parentSignal = signal ? AbortSignal.any([signal,controller.signal]) : controller.signal
-    job.state = 'running'; job.attempts++; job.error = null; job.attemptId = crypto.randomUUID(); job.startedAt = this.clock()
+    job.state = 'running'; job.attempts++; job.error = null; job.attemptId = crypto.randomUUID(); job.startedAt = this.clock(); job.dispatched = false
     job.deadlineAt = this.clock()+(job.options.parser === 'deepseek' ? 180000 : 60000)
     this.#saveJob(job)
     const current = () => {
@@ -602,7 +605,7 @@ export class AssetService {
       const parsed = await withDeadline(job.options.parser === 'deepseek' ? 180000 : 60000,parentSignal,deadline =>
         parseDocument({...asset,parseOptions:job.options},bytes,this.env,{
           signal:deadline,fetcher:this.fetcher,assertCurrent:current,
-          onDispatch:() => { current(); job.deadlineAt = this.clock()+180000; this.#saveJob(job) },
+          onDispatch:() => { current(); job.dispatched = true; job.deadlineAt = this.clock()+180000; this.#saveJob(job) },
           maxTextBytes:this.maxParsedBytes-Math.min(256*1024,Math.floor(this.maxParsedBytes/4)),
           maxResponseBytes:Math.min(16*MiB,this.maxParsedBytes*4),maxPages:1000,
         }))
@@ -636,7 +639,7 @@ export class AssetService {
         const code = errorCode(error,parentSignal.aborted ? 'parse_interrupted' : 'attachment_parse_failed')
         if (code === 'parser_rate_limited' && job.attempts < 3) {
           job.state = 'queued'; job.due = this.clock()+(error.retryAfterMs || 30000)
-        } else if (code === 'ocr_completion_unknown' || (job.options.parser === 'deepseek' && (parentSignal.aborted || error?.name === 'TimeoutError'))) {
+        } else if (code === 'ocr_completion_unknown' || (job.options.parser === 'deepseek' && job.dispatched && (parentSignal.aborted || error?.name === 'TimeoutError'))) {
           job.state = 'unknown'; job.error = 'ocr_completion_unknown'
         } else job.state = 'failed'
         job.error ||= code

@@ -31,7 +31,9 @@
 
 ## 2. 配置 Worker 运行时变量与 Secrets
 
-在 **Worker → Settings → Variables and Secrets** 设置运行时值。Build variables 仅供构建；把凭据只放在构建环境中，线上代码读不到。`keep_vars:true` 保留 Dashboard 的运行时变量。完整模板见 [`.dev.vars.example`](../.dev.vars.example)，真实秘密不提交 GitHub。
+在 **Worker → Settings → Variables and Secrets** 设置运行时值。Build variables 仅供构建；把凭据只放在构建环境中，线上代码读不到。`keep_vars:true` 保留 Dashboard 的普通运行时变量。完整模板见 [`.dev.vars.example`](../.dev.vars.example)，真实秘密不提交 GitHub。
+
+运营方 Secret 也支持 **Cloudflare Secrets Store 原生 binding**，使用相同变量名。通过 Dashboard 添加后，必须将实际 `store_id / secret_name / binding` 写入 `wrangler.jsonc` 才能稳定随 Git 部署；`keep_vars:true` 不保留 Dashboard-only Secrets Store binding。首次填写、Supabase key 区别和集中轮换步骤见[环境变量与 Secrets Store](environment-and-secrets.md)。
 
 ### 最小可用：身份与模型连接
 
@@ -51,7 +53,7 @@ openssl rand -base64 32
 
 保存输出为 Secret。直接换值会使已保存连接无法解密；正式轮换需要重加密迁移。不要用 Supabase service role 或用户 token 代替主密钥。
 
-验证器支持 Supabase ES256 / RS256 JWKS，校验签名、issuer、audience、角色、subject 与到期时间。旧 HS256 项目需要先迁移签名配置；Worker 不需要 service role。App 登录后携带 access token，模型 key 由各用户调用 `POST /v1/connections/model` 保存到自己的加密连接，通常不需要全局模型 Secret。
+验证器支持 Supabase ES256 / RS256 JWKS，校验签名、issuer、audience、角色、subject 与到期时间。旧 HS256 项目需要先迁移签名配置；Worker 不需要 `SUPABASE_SERVICE_ROLE_KEY` 或 `SUPABASE_ANON_KEY`。App 登录后携带 access token，模型 key 由各用户调用 `POST /v1/connections/model` 保存到自己的加密连接，后续任务只用 `connectionId`；普通模型路径没有全局 `OPENAI_API_KEY` 配置。
 
 没有邮箱、MCP、OCR 或托管配置时，仍可创建不绑定这些资源的普通模型 Task。`GET /v1/status` 查看当前功能配置，`GET /v1/capabilities` 查看具体模型 / 邮箱能力；这些结果不等于外部账号已经联调成功。
 

@@ -21,6 +21,75 @@ const grant = (extras = {}) => ({
   refresh_token: 'secret-mail-refresh', scope: gmail + 'modify', ...extras,
 });
 
+test('mail OAuth reads the current client-secret binding and lookup failures preserve unused state and active grants', async t => {
+  let value = 'client-secret-v1', unavailable = true, reads = 0;
+  const config = { ...env, GOOGLE_CLIENT_SECRET: { async get() {
+    reads++;
+    if (unavailable) throw Error('upstream-private-value');
+    return value;
+  } } };
+  const conn = new ConnectionStore(storage(t), config);
+  const used = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (url.includes('userinfo')) return Response.json({ sub: 'binding-account' });
+    used.push(options.body.get('client_secret'));
+    return Response.json(grant({ expires_in: options.body.get('grant_type') === 'authorization_code' ? 1 : 3600 }));
+  });
+  const { state } = await conn.beginOAuth({ provider: 'gmail', actions: ['archive'] });
+  assert.equal(reads, 0, 'authorization URL construction does not fetch a client secret');
+  await assert.rejects(conn.completeOAuth({ state, code: 'fixture-code' }), { code: 'oauth_configuration_missing', beforeDispatch: true });
+  assert.deepEqual(used, []);
+  unavailable = false;
+  const connected = await conn.completeOAuth({ state, code: 'fixture-code' });
+  assert.deepEqual(used, ['client-secret-v1']);
+  unavailable = true;
+  await assert.rejects(conn.credential(connected.id, connected.epoch), { code: 'oauth_configuration_missing' });
+  assert.equal(conn.get(connected.id).status, 'active');
+  value = 'client-secret-v2'; unavailable = false;
+  assert.equal(await conn.credential(connected.id, connected.epoch), 'secret-mail-access');
+  assert.deepEqual(used, ['client-secret-v1', 'client-secret-v2']);
+});
+
+test('mail OAuth rechecks session authority after a pending secret lookup before redeeming', async t => {
+  let ready, release, allowed = true, calls = 0;
+  const started = new Promise(resolve => { ready = resolve; });
+  const waiting = new Promise(resolve => { release = resolve; });
+  const conn = new ConnectionStore(storage(t), { ...env, GOOGLE_CLIENT_SECRET: {
+    async get() { ready(); await waiting; return 'fixture-secret'; },
+  } });
+  t.mock.method(globalThis, 'fetch', async () => { calls++; throw Error('unexpected provider I/O'); });
+  const { state } = await conn.beginOAuth({ provider: 'gmail', actions: ['archive'] });
+  const request = conn.completeOAuth({ state, code: 'fixture-code' }, { assertAuthorized() {
+    if (!allowed) throw Object.assign(Error('session_revoked'), { code: 'session_revoked', status: 403 });
+  } });
+  const rejected = assert.rejects(request, { code: 'session_revoked' });
+  await started;
+  allowed = false; release();
+  await rejected;
+  assert.equal(calls, 0);
+});
+
+test('a revoked mailbox cannot refresh after waiting for a rotated client-secret binding', async t => {
+  let ready, release, waiting = false, calls = 0;
+  const started = new Promise(resolve => { ready = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const conn = new ConnectionStore(storage(t), { ...env, GOOGLE_CLIENT_SECRET: {
+    async get() { if (waiting) { ready(); await gate; } return 'fixture-secret'; },
+  } });
+  t.mock.method(globalThis, 'fetch', async url => {
+    calls++;
+    return Response.json(url.includes('userinfo') ? { sub: 'bound-account' } : grant({ expires_in: 1 }));
+  });
+  const { state } = await conn.beginOAuth({ provider: 'gmail', actions: ['archive'] });
+  const connected = await conn.completeOAuth({ state, code: 'fixture-code' });
+  waiting = true;
+  const rejected = assert.rejects(conn.credential(connected.id, connected.epoch), { code: 'connection_changed' });
+  await started;
+  conn.revoke(connected.id, connected.epoch);
+  release(); await rejected;
+  assert.equal(calls, 2);
+});
+
 test('model keys are sealed to one account, rotate by epoch and disappear from public projections', async t => {
   const left = storage(t), right = storage(t);
   const alice = new ConnectionStore(left, env), bob = new ConnectionStore(right, env);

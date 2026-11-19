@@ -12,13 +12,13 @@ const response = (body,status = 200) => Response.json(body,{status})
 const listing = data => ({data,has_more:false,last_id:data.at(-1)?.id ?? null})
 
 function provider() {
-  const p = {calls:[],sessions:new Map(),files:new Map(),artifacts:[],text:'Analysis complete.',nextStatus:'idle',
+  const p = {calls:[],sessions:new Map(),files:new Map(),artifacts:[],text:'Analysis complete.',nextStatus:'idle',credential:'fixture-server-credential',
     lostCreate:0,lostUpload:0,confirmCancel:false,hook:null}
   p.fetch = async (url,options = {}) => {
     const parsed = new URL(url),path = parsed.pathname,method = options.method || 'GET'
     assert.equal(parsed.origin,'https://api.openai.com')
     assert.equal(options.redirect,'manual')
-    assert.equal(options.headers.Authorization,'Bearer fixture-server-credential')
+    assert.equal(options.headers.Authorization,'Bearer '+p.credential)
     assert.equal(options.headers['OpenAI-Beta'],'agents=v1')
     const body = typeof options.body === 'string' ? JSON.parse(options.body) : options.body
     const call = {path,method,body,query:parsed.searchParams}
@@ -132,6 +132,77 @@ test('hosted execution is disabled until the server profile is explicitly config
   const invalid = new HostedExecutionService(f.store,{HOSTED_AGENT_ENABLED:'true'})
   assert.equal(invalid.capabilities().enabled,false)
   assert.throws(() => invalid.start(spec),{code:'hosted_not_configured'})
+})
+
+test('secret lookup failure leaves both create and upload safely prepared for a background retry',async t => {
+  for (const attachment of [false,true]) await t.test(attachment ? 'upload' : 'create',async t => {
+    let available = false
+    const binding = {async get() {
+      if (!available) throw new Error('operator-key-must-not-be-persisted')
+      return 'fixture-server-credential'
+    }}
+    const f = fixture(t,{environment:{...env,OPENAI_AGENTS_API_KEY:binding}})
+    assert.equal(f.executor.capabilities().enabled,true)
+    const attachmentIds = attachment ? [await f.input()] : []
+    const job = f.executor.start({...spec,attachmentIds})
+    await f.step()
+    const stored = f.executor.get(job.executionId)
+    assert.equal(stored.state,'prepared')
+    assert.equal(stored.submitted,false)
+    assert.equal(stored.uploads.some(file => file.state === 'uploading'),false)
+    assert.equal(stored.lastError,'hosted_secret_unavailable')
+    assert.equal(f.p.calls.length,0)
+    assert.equal(JSON.stringify(stored).includes('operator-key-must-not-be-persisted'),false)
+    available = true
+    f.restart()
+    await f.drain()
+    assert.equal(f.executor.inspect(job.executionId).state,'completed')
+    assert.equal(f.p.calls.filter(call => call.method === 'POST' && call.path === '/v1/agents/sessions').length,1)
+    assert.equal(f.p.calls.filter(call => call.method === 'POST' && call.path === '/v1/files').length,attachment ? 1 : 0)
+  })
+})
+
+test('authority revoked while reading a binding prevents both attachment upload and session creation',async t => {
+  for (const attachment of [false,true]) await t.test(attachment ? 'upload' : 'create',async t => {
+    let allowed = true,ready,release
+    const started = new Promise(resolve => { ready = resolve })
+    const pending = new Promise(resolve => { release = resolve })
+    const binding = {get() { ready(); return pending }}
+    const f = fixture(t,{environment:{...env,OPENAI_AGENTS_API_KEY:binding},assertCurrent:() => allowed})
+    const attachmentIds = attachment ? [await f.input()] : []
+    const job = f.executor.start({...spec,attachmentIds})
+    const running = f.step()
+    await started
+    assert.equal(f.executor.get(job.executionId).state,'prepared')
+    assert.equal(f.executor.get(job.executionId).submitted,false)
+    assert.equal(f.executor.get(job.executionId).uploads.length,0)
+    allowed = false
+    release('fixture-server-credential')
+    await running
+    assert.equal(f.p.calls.length,0)
+    assert.equal(f.executor.inspect(job.executionId).state,'cancel_requested')
+    assert.equal(f.executor.get(job.executionId).submitted,false)
+    await f.drain()
+    assert.equal(f.executor.inspect(job.executionId).state,'cancelled')
+    assert.equal(f.executor.inspect(job.executionId).cleanup,'completed')
+    assert.equal(f.p.calls.length,0)
+  })
+})
+
+test('a live hosted service uses a rotated operator key on subsequent background steps',async t => {
+  let current = 'fixture-server-credential',reads = 0
+  const binding = {async get() { reads++; return current }}
+  const f = fixture(t,{environment:{...env,OPENAI_AGENTS_API_KEY:binding}})
+  const job = f.executor.start(spec)
+  await f.step()
+  current = f.p.credential = 'fixture-rotated-credential'
+  await f.drain()
+  assert.equal(f.executor.inspect(job.executionId).state,'completed')
+  assert.equal(reads,f.p.calls.length)
+  assert.ok(reads > 1)
+  const stored = JSON.stringify(f.executor.get(job.executionId))
+  assert.equal(stored.includes('fixture-server-credential'),false)
+  assert.equal(stored.includes('fixture-rotated-credential'),false)
 })
 
 test('one scoped task completes, records usage and cleans its dedicated session without business tools',async t => {

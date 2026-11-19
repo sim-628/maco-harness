@@ -1,6 +1,7 @@
 import { mailCapabilities, readOAuthScopes } from '../mail/policy.mjs';
 import { withDeadline } from '../deadline.mjs';
 import { failure } from './crypto.mjs';
+import { hasSecret, readSecret } from '../secrets.mjs';
 
 const providers = {
   gmail: {
@@ -48,7 +49,8 @@ export function validateActions(provider, actions) {
 
 function config(provider, env) {
   const spec = providers[provider];
-  if (!spec || !env[spec.clientId] || !env[spec.clientSecret]) throw failure('oauth_configuration_missing', 503);
+  if (!spec || typeof env[spec.clientId] !== 'string' || !env[spec.clientId].trim() ||
+    !hasSecret(env[spec.clientSecret])) throw failure('oauth_configuration_missing', 503);
   return spec;
 }
 
@@ -114,26 +116,32 @@ function toGrant(data, priorScopes, previousRefresh) {
   return { scopes, secret: { accessToken: data.access_token, refreshToken, expiresAt: Date.now() + data.expires_in * 1000 } };
 }
 
-async function token(provider, env, values) {
+async function token(provider, env, values, { assertAuthorized, onDispatch } = {}) {
   const spec = config(provider, env);
+  const clientId = env[spec.clientId];
+  assertAuthorized?.();
+  const clientSecret = await readSecret(env[spec.clientSecret], { code: 'oauth_configuration_missing' });
+  assertAuthorized?.();
+  onDispatch?.();
   return remoteJSON(spec.token, {
     method: 'POST',
-    body: new URLSearchParams({ client_id: env[spec.clientId], client_secret: env[spec.clientSecret], ...values }),
+    body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, ...values }),
   });
 }
 
-export async function redeemCode(provider, env, code, txn) {
+export async function redeemCode(provider, env, code, txn, { assertAuthorized, onDispatch } = {}) {
   const data = await token(provider, env, {
     grant_type: 'authorization_code', code, redirect_uri: txn.redirect, code_verifier: txn.verifier,
-  });
+  }, { assertAuthorized, onDispatch });
   const result = toGrant(data, txn.scopes);
+  assertAuthorized?.();
   const profile = await remoteJSON(providers[provider].profile, { headers: { Authorization: 'Bearer ' + result.secret.accessToken } });
   const accountId = provider === 'gmail' ? profile.sub : profile.id;
   if (typeof accountId !== 'string' || !accountId.trim() || accountId.length > 256) throw failure('oauth_account_unverified', 403);
   return { ...result, accountId };
 }
 
-export async function refreshGrant(provider, env, secret, scopes) {
-  const data = await token(provider, env, { grant_type: 'refresh_token', refresh_token: secret.refreshToken });
+export async function refreshGrant(provider, env, secret, scopes, options = {}) {
+  const data = await token(provider, env, { grant_type: 'refresh_token', refresh_token: secret.refreshToken }, options);
   return toGrant(data, scopes, secret.refreshToken);
 }

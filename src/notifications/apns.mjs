@@ -1,9 +1,10 @@
 import { failure, toBase64Url, VaultCipher } from '../connections/crypto.mjs'
 import { withDeadline } from '../deadline.mjs'
 import { b64JSON, boundedJSON, check, digest } from './common.mjs'
+import { hasSecret, readSecret } from '../secrets.mjs'
 
 export function apnsConfiguration(env) {
-  const enabled=!!(env.APNS_TEAM_ID&&env.APNS_KEY_ID&&env.APNS_PRIVATE_KEY&&env.APNS_TOPIC)
+  const enabled=!!(env.APNS_TEAM_ID&&env.APNS_KEY_ID&&hasSecret(env.APNS_PRIVATE_KEY)&&env.APNS_TOPIC)
   if(!enabled)return {enabled:false}
   check(/^[A-Z0-9]{10}$/.test(env.APNS_TEAM_ID)&&/^[A-Z0-9]{10}$/.test(env.APNS_KEY_ID),'apns_configuration_invalid',503)
   check(/^[A-Za-z0-9.-]{3,256}$/.test(env.APNS_TOPIC),'apns_configuration_invalid',503)
@@ -32,7 +33,8 @@ export class APNsTokenProvider {
   async issue() {
     const cfg=apnsConfiguration(this.env)
     check(cfg.enabled,'apns_not_configured',503)
-    const config=await digest(JSON.stringify([cfg.teamId,cfg.keyId,cfg.privateKey,cfg.environment]))
+    const material=await readSecret(cfg.privateKey,{code:'apns_key_invalid'})
+    const config=await digest(JSON.stringify([cfg.teamId,cfg.keyId,material,cfg.environment]))
     const prior=this.storage.sql.exec('SELECT * FROM notification_signer_tokens WHERE id=1').toArray()[0]
     if(prior?.config===config&&this.now()-prior.issued<45*60000&&prior.issued<=this.now()+30000) {
       const secret=await this.cipher.open(['apns',config],prior.sealed)
@@ -40,7 +42,7 @@ export class APNsTokenProvider {
     }
     let privateKey
     try {
-      const pem=cfg.privateKey.replace(/\\n/g,'\n')
+      const pem=material.replace(/\\n/g,'\n')
       check(/^\s*-----BEGIN PRIVATE KEY-----[\s\S]*-----END PRIVATE KEY-----\s*$/.test(pem),'apns_key_invalid',503)
       const raw=Uint8Array.from(atob(pem.replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s/g,'')),c=>c.charCodeAt(0))
       privateKey=await crypto.subtle.importKey('pkcs8',raw,{name:'ECDSA',namedCurve:'P-256'},false,['sign'])

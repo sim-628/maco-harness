@@ -14,7 +14,7 @@ const canonical = value => JSON.stringify(value,(_,item) => item && typeof item 
   ? Object.fromEntries(Object.keys(item).sort().map(key => [key,item[key]])) : item)
 const hash = async bytes => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),n => n.toString(16).padStart(2,'0')).join('')
 const definitiveRejection = error => error.upstreamStatus >= 400 && error.upstreamStatus < 500 && ![408,409].includes(error.upstreamStatus)
-const retryable = error => ['hosted_unavailable','hosted_rate_limited','hosted_request_aborted','hosted_storage_unavailable'].includes(error.code)
+const retryable = error => ['hosted_unavailable','hosted_rate_limited','hosted_request_aborted','hosted_storage_unavailable','hosted_secret_unavailable'].includes(error.code)
   || error.status >= 500 && !String(error.code).startsWith('hosted_')
 const fileName = value => String(value || 'attachment').replace(/[\x00-\x1f/\\]/g,'_').replace(/^\.+/,'').slice(0,160) || 'attachment'
 const assetView = asset => ({id:asset.id,name:asset.name,mimeType:asset.mimeType,size:asset.size,
@@ -304,16 +304,20 @@ export class HostedExecutionService {
       const file = previous ?? {assetId,name,size:bytes.length,sha256:digest,
         path:`/workspace/inputs/${job.uploads.length}-${name}`,
         filename:`maco-${job.intent}-${job.uploads.length}.${name.split('.').at(-1).replace(/[^A-Za-z0-9]/g,'').slice(0,16) || 'bin'}`}
-      this.change(id,current => {
-        const found = current.uploads.find(item => item.assetId === assetId)
-        if (!found) current.uploads.push(file)
-        Object.assign(found ?? file,{state:'uploading',startedAt:this.now(),after:null})
-      },lease)
       let uploaded
-      try { uploaded = await this.client.upload(bytes,file.filename,signal) }
+      try { uploaded = await this.client.upload(bytes,file.filename,signal,{
+        beforeDispatch:() => this.guard(id,lease,{attachments:true}),
+        onDispatch:() => this.change(id,current => {
+          if (!active(current)) throw hostedError(STOPPED)
+          const found = current.uploads.find(item => item.assetId === assetId)
+          if (!found) current.uploads.push(file)
+          Object.assign(found ?? file,{state:'uploading',startedAt:this.now(),after:null})
+        },lease),
+      }) }
       catch (error) {
-        if (definitiveRejection(error)) this.change(id,current => {
-          current.uploads.find(item => item.assetId === assetId).state = 'prepared'
+        if (definitiveRejection(error) || error.beforeDispatch) this.change(id,current => {
+          const file = current.uploads.find(item => item.assetId === assetId)
+          if (file?.state === 'uploading') file.state = 'prepared'
         },lease)
         throw error
       }
@@ -327,13 +331,16 @@ export class HostedExecutionService {
     }
     job = await this.guard(id,lease,{attachments:true})
     const body = sessionBody(job,this.scope)
-    this.change(id,current => {
-      current.state = 'submitting'; current.submitted = true; current.submittedAt = this.now(); current.due = this.now()+current.profile.pollMS
-    },lease,true)
     let session
-    try { session = await this.client.create(body,signal) }
+    try { session = await this.client.create(body,signal,{
+      beforeDispatch:() => this.guard(id,lease,{attachments:true}),
+      onDispatch:() => this.change(id,current => {
+        if (!active(current)) throw hostedError(STOPPED)
+        current.state = 'submitting'; current.submitted = true; current.submittedAt = this.now(); current.due = this.now()+current.profile.pollMS
+      },lease,true),
+    }) }
     catch (error) {
-      if (definitiveRejection(error)) this.change(id,current => {
+      if (definitiveRejection(error) || error.beforeDispatch) this.change(id,current => {
         current.submitted = false
         if (current.state === 'submitting') current.state = 'prepared'
       },lease)
@@ -412,7 +419,8 @@ export class HostedExecutionService {
   }
   async poll(id,lease,signal) {
     let job = await this.guard(id,lease,{attachments:true})
-    const session = await this.client.retrieve(job.sessionId,signal)
+    const beforeDispatch = () => this.guard(id,lease,{attachments:true})
+    const session = await this.client.retrieve(job.sessionId,signal,{beforeDispatch})
     job = await this.guard(id,lease)
     if (!session) {
       this.change(id,current => { current.sessionDeleted = true },lease)
@@ -424,7 +432,7 @@ export class HostedExecutionService {
     }
     if (session.status === 'failed') { this.finish(id,'failed','hosted_task_failed',lease); return }
     if (session.status !== 'idle') { this.defer(id,lease,job.profile.pollMS); return }
-    const turns = page(await this.client.turns(job.sessionId,{order:'desc',limit:20,signal}))
+    const turns = page(await this.client.turns(job.sessionId,{order:'desc',limit:20,signal,beforeDispatch}))
     job = await this.guard(id,lease)
     const turn = turns.data.find(value => !value.subagent_id)
     if (!turn || ['queued','waiting','in_progress'].includes(turn.status)) { this.defer(id,lease,job.profile.pollMS); return }
@@ -444,8 +452,9 @@ export class HostedExecutionService {
 
   async collect(id,lease,signal) {
     let job = await this.guard(id,lease,{attachments:true})
+    const beforeDispatch = () => this.guard(id,lease,{attachments:true})
     if (job.collection.phase === 'items') {
-      const items = page(await this.client.items(job.sessionId,job.turnId,{after:job.collection.after,signal}),job.collection.after)
+      const items = page(await this.client.items(job.sessionId,job.turnId,{after:job.collection.after,signal,beforeDispatch}),job.collection.after)
       job = await this.guard(id,lease)
       this.change(id,current => {
         const collection = current.collection
@@ -470,7 +479,7 @@ export class HostedExecutionService {
       return
     }
     if (job.collection.phase === 'artifacts') {
-      const artifacts = page(await this.client.artifacts(job.sessionId,{signal}))
+      const artifacts = page(await this.client.artifacts(job.sessionId,{signal,beforeDispatch}))
       job = await this.guard(id,lease)
       this.change(id,current => {
         const collection = current.collection
@@ -500,7 +509,7 @@ export class HostedExecutionService {
     const artifact = job.collection.artifacts.find(value => !value.asset)
     if (artifact) {
       requireThat(this.assets?.put,'assets_unavailable',503)
-      const bytes = await this.client.artifactBytes(job.sessionId,artifact.remoteId,Math.min(artifact.size,job.profile.maxArtifactBytes),signal)
+      const bytes = await this.client.artifactBytes(job.sessionId,artifact.remoteId,Math.min(artifact.size,job.profile.maxArtifactBytes),signal,{beforeDispatch})
       await this.guard(id,lease)
       requireThat(bytes.length === artifact.size,'hosted_artifact_corrupt',502)
       validateArtifactBytes(bytes,artifact)

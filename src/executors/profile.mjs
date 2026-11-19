@@ -1,4 +1,5 @@
 import { requireThat } from '../protocol.mjs'
+import { hasSecret } from '../secrets.mjs'
 
 const effortValues = new Set(['none','minimal','low','medium','high','xhigh','max'])
 const encoder = new TextEncoder()
@@ -13,8 +14,9 @@ function setting(env,name,fallback,min,max) {
 export function hostedProfile(env) {
   const enabled = env.HOSTED_AGENT_ENABLED === 'true'
   if (!enabled) return {enabled:false}
-  requireThat(typeof env.OPENAI_AGENTS_API_KEY === 'string' && env.OPENAI_AGENTS_API_KEY.trim()
-    && !/[\r\n]/.test(env.OPENAI_AGENTS_API_KEY),'hosted_not_configured',503)
+  requireThat(hasSecret(env.OPENAI_AGENTS_API_KEY)
+    && (typeof env.OPENAI_AGENTS_API_KEY !== 'string' || !/[\r\n]/.test(env.OPENAI_AGENTS_API_KEY)),
+    'hosted_not_configured',503)
   const model = env.HOSTED_AGENT_MODEL
   const name = env.HOSTED_AGENT_PROFILE || 'document-analysis'
   const effort = env.HOSTED_AGENT_EFFORT || 'medium'
