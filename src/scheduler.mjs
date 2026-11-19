@@ -8,8 +8,8 @@ const earliest = values => {
 }
 
 export class ExecutionHost {
-  constructor(ctx,store,harness,mail,{maintenance=[]} = {}) {
-    Object.assign(this,{ctx,store,harness,mail,maintenance})
+  constructor(ctx,store,harness,mail,{maintenance=[],enabled=()=>true} = {}) {
+    Object.assign(this,{ctx,store,harness,mail,maintenance,enabled})
     this.tasks = new Map()
     this.ops = new Map()
     this.jobs = new Map()
@@ -51,6 +51,7 @@ export class ExecutionHost {
     })
     this.ctx.waitUntil(this.pump)
   }
+  abortAll() { for (const entry of this.tasks.values()) entry.controller.abort() }
   abort(taskId) { this.tasks.get(taskId)?.controller.abort() }
   launch(map,id,entry,run) {
     map.set(id,entry)
@@ -61,13 +62,14 @@ export class ExecutionHost {
     this.ctx.waitUntil(finished)
   }
   maintenanceDue(job) {
+    if (!this.enabled() && !job.duringLifecycle) return null
     const due = dueTime(job.nextDue())
     return due === null ? null : Math.max(due,job.retryAfter || 0)
   }
   async dispatch() {
     // Register repair before starting I/O. Alarm is the only durable wake owner.
     await this.arm(Date.now()+30000)
-    for (const {data} of this.store.rows("SELECT data FROM tasks WHERE state='queued' AND due<=? ORDER BY (json_extract(data,'$.priority')='background'), rowid LIMIT 32", Date.now())) {
+    for (const {data} of (this.enabled() ? this.store.rows("SELECT data FROM tasks WHERE state='queued' AND due<=? ORDER BY (json_extract(data,'$.priority')='background'), rowid LIMIT 32", Date.now()) : [])) {
       if (this.tasks.size >= 2) break
       const t = JSON.parse(data)
       if (this.tasks.has(t.id)) continue
@@ -79,7 +81,7 @@ export class ExecutionHost {
       this.launch(this.tasks,t.id,{controller,background:t.priority==='background'},
         () => withDeadline(120000,controller.signal,signal => this.harness.run(t,signal)))
     }
-    const available = 4 - this.ops.size
+    const available = this.enabled() ? 4 - this.ops.size : 0
     if (available > 0) {
       const due = this.store.rows(`SELECT o.id,o.resource FROM operations o WHERE o.state='queued' AND o.due<=?
         AND NOT EXISTS(SELECT 1 FROM operations p WHERE p.resource=o.resource AND
@@ -93,33 +95,33 @@ export class ExecutionHost {
     }
     // Maintenance uses the same durable alarm and never occupies a foreground
     // task slot. Start auxiliary model extraction only while task slots are idle.
-    if (!this.jobs.size) {
-      const job = this.maintenance.map(job => ({job,due:this.maintenanceDue(job)}))
-        .filter(({job,due}) => due !== null && due <= Date.now() && (!job.idleOnly || !this.tasks.size))
-        .sort((a,b) => a.due-b.due)[0]?.job
-      if (job) this.launch(this.jobs,job.name,{},async () => {
+    const availableJobs = this.maintenance.map(job => ({job,due:this.maintenanceDue(job)}))
+      .filter(({job,due}) => !this.jobs.has(job.name) && due !== null && due <= Date.now() && (!job.idleOnly || !this.tasks.size))
+      .sort((a,b) => a.due-b.due)
+    for (const {job} of availableJobs) {
+      if (this.jobs.size>=3) break
+      this.launch(this.jobs,job.name,{},async () => {
         try {
-          await withDeadline(60000,null,signal => job.run(signal))
+          await withDeadline(job.timeoutMs || 60000,null,signal => job.run(signal))
           job.retryAfter = 0
         } catch (error) {
-          // Domain jobs persist normal retries. Unexpected bugs are cooled down
-          // here as a last resort so a malformed job cannot spin the event loop.
+          // Domain jobs persist normal retries. Unexpected failures cool down.
           job.retryAfter = Date.now()+30000
           this.store.event('maintenance.failed',{name:job.name,code:errorCode(error,'maintenance_failed')})
         }
       })
     }
-    const future = this.store.one(`SELECT MIN(due) AS due FROM (
+    const future = this.enabled() ? this.store.one(`SELECT MIN(due) AS due FROM (
       SELECT due FROM tasks WHERE state='queued' AND due>? UNION ALL
-      SELECT due FROM operations WHERE state='queued' AND due>?)`,Date.now(),Date.now()).due
+      SELECT due FROM operations WHERE state='queued' AND due>?)`,Date.now(),Date.now()).due : null
     const next = earliest([future,...this.maintenance.map(job => this.maintenanceDue(job))].filter(value => value > Date.now()))
     if (next !== null) await this.arm(next)
   }
   async alarm() {
     // An idle schedule far in the future should hibernate until the due time.
-    const taskDue = this.store.one(`SELECT MIN(due) AS due FROM (
+    const taskDue = this.enabled() ? this.store.one(`SELECT MIN(due) AS due FROM (
       SELECT due FROM tasks WHERE state IN ('running','queued') UNION ALL
-      SELECT due FROM operations WHERE state IN ('dispatching','queued'))`).due
+      SELECT due FROM operations WHERE state IN ('dispatching','queued'))`).due : null
     const next = earliest([taskDue,...this.maintenance.map(job => this.maintenanceDue(job))])
     if (next === null) return
     if (next > Date.now()) { await this.arm(next); return }

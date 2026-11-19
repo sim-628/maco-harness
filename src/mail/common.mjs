@@ -37,7 +37,7 @@ export async function digest(bytes) {
   return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), b => b.toString(16).padStart(2,'0')).join('');
 }
 
-async function boundedJSON(response, max) {
+async function boundedBody(response, max, binary=false) {
   if (!response.body) return null;
   if (Number(response.headers.get('content-length')) > max) {
     await response.body.cancel();
@@ -59,12 +59,13 @@ async function boundedJSON(response, max) {
     bytes.set(value,size);
     size=end;
   }
+  if (binary) return bytes.slice(0,size);
   if (!size) return null;
   try { return JSON.parse(decoder.decode(bytes.subarray(0,size))); } catch { throw fault('invalid_provider_response'); }
 }
 
 // Only adapter-constructed relative endpoints ever receive a credential. A redirect may change origin.
-export async function request(ctx, path, {method='GET', query, body, contentType='application/json', max=2*1024*1024, headers={}} = {}) {
+export async function request(ctx, path, {method='GET', query, body, contentType='application/json', max=2*1024*1024, headers={},binary=false} = {}) {
   const {credential,fetchImpl=fetch} = ctx;
   if (!bases[credential?.provider] || !credential?.accessToken) throw fault('reauthorization_required');
   const url = new URL(bases[credential.provider] + (path ? '/' + path : ''));
@@ -81,14 +82,17 @@ export async function request(ctx, path, {method='GET', query, body, contentType
     };
     // There is no yield between epoch revalidation and dispatch.
     if (write) ctx.beforeWrite?.();
+    else ctx.assertCurrent?.();
     let response;
     try { response = await fetchImpl(url.toString(), init); }
     catch { throw fault(write ? 'submission_unknown' : 'provider_unavailable'); }
-    return readResponse(response,max,write);
+    const result=await readResponse(response,max,write,binary);
+    if (!write) ctx.assertCurrent?.();
+    return result;
   });
 }
 
-async function readResponse(response,max,write) {
+async function readResponse(response,max,write,binary) {
   if (!response.ok) {
     try { await response.body?.cancel(); } catch {}
     let code = 'provider_rejected';
@@ -106,6 +110,6 @@ async function readResponse(response,max,write) {
       }
       throw error;
   }
-  try { return {status:response.status,data:await boundedJSON(response,max)}; }
+  try { return {status:response.status,data:await boundedBody(response,max,binary)}; }
   catch (error) { throw write ? fault('submission_unknown') : error; }
 }

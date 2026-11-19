@@ -19,8 +19,10 @@ const schema = [
 ]
 
 export function taskView(t) {
-  const {id, runId, profile, mailboxId, state, version, priority, createdAt, updatedAt, error, waitingOperationId, timeZone, context} = t
-  return {taskId:id, runId, modelProfile:profile, mailboxId, state, taskVersion:version, priority, createdAt, updatedAt, error, waitingOperationId, timeZone, context}
+  const {id, runId, profile, mailboxId, state, version, priority, createdAt, updatedAt, error, waitingOperationId, waitingExternalId, waitingInteractionId, timeZone, context} = t
+  return {taskId:id, runId, conversationId:t.conversationId || 'primary', modelProfile:profile, mailboxId,
+    mailboxIds:t.mailboxIds || (mailboxId ? [mailboxId] : []),connectorIds:t.connectorIds || [],assetIds:t.assetIds || [],allowHosted:t.allowHosted===true,readOnly:t.readOnly===true,
+    state, taskVersion:version, priority, createdAt, updatedAt, error, waitingOperationId, waitingExternalId, waitingInteractionId, timeZone, context}
 }
 
 export function operationView(op) {
@@ -31,6 +33,7 @@ export function operationView(op) {
 
 export function publicMessage(message) {
   const {providerState, historyEpoch, ...rest} = message
+  if (rest.toolCalls) rest.toolCalls = rest.toolCalls.map(({binding,...call}) => call)
   return rest
 }
 
@@ -56,6 +59,7 @@ export class Store {
   }
   event(type, fields) {
     if (!this.pending) return this.tx(() => this.event(type, fields))
+    this.onEvent?.(type,fields)
     const data = {protocolVersion:PROTOCOL_VERSION, type, at:Date.now(), ...fields}
     // A snapshot taken mid-stream must include all deltas at its cursor.
     if (type === 'attempt.started') {
@@ -78,9 +82,10 @@ export class Store {
     return this.tx(() => {
       const old = this.seen(id, digest)
       if (old) return old
-      const result = apply()
-      this.rows('INSERT INTO commands VALUES (?,?,?)', id, digest, JSON.stringify(result))
-      return result
+      const serialized = JSON.stringify(apply())
+      this.rows('INSERT INTO commands VALUES (?,?,?)', id, digest, serialized)
+      // First delivery and an idempotent replay have the same JSON shape.
+      return JSON.parse(serialized)
     })
   }
   getTask(id) {
@@ -150,7 +155,7 @@ export class Store {
     }]))
   }
   taskPage(before = Number.MAX_SAFE_INTEGER, activeOnly = false) {
-    const filter = activeOnly ? "AND state IN ('running','waiting_mail','queued','needs_review')" : ''
+    const filter = activeOnly ? "AND state IN ('running','waiting_mail','queued','needs_review','waiting_external','waiting_connector','waiting_user')" : ''
     const rows = this.rows(`SELECT rowid AS n,data FROM tasks WHERE rowid<? ${filter} ORDER BY rowid DESC LIMIT 101`,before)
     return {tasks:rows.slice(0,100).map(r => taskView(JSON.parse(r.data))), nextTaskBefore:rows.length>100 ? rows[99].n : null}
   }

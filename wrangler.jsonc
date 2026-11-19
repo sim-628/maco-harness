@@ -7,11 +7,48 @@
   "observability": {
     "enabled": true,
     "redact_query_string": true,
-    "logs": { "enabled": true, "head_sampling_rate": 0.1, "invocation_logs": true },
-    "traces": { "enabled": true, "head_sampling_rate": 0.05 }
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 0.1,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.05
+    }
   },
   "durable_objects": {
-    "bindings": [{ "name": "AGENTS", "class_name": "MacoAgent" }]
+    "bindings": [
+      {
+        "name": "AGENTS",
+        "class_name": "MacoAgent"
+      },
+      {
+        "name": "NOTIFICATIONS",
+        "class_name": "NotificationRegistry"
+      }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MacoAgent"] }]
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "MacoAgent"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "NotificationRegistry"
+      ]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ASSETS"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  }
 }

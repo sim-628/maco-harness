@@ -1,3 +1,4 @@
+import { assertFrozenAssetReferences } from './mail/compose.mjs'
 import { withDeadline } from './deadline.mjs'
 import { prepareMailCommand, executeMailCommand, mailCapabilities } from './mail/index.mjs'
 import { checkedVersion, requireThat, errorCode } from './protocol.mjs'
@@ -6,20 +7,23 @@ import { operationView } from './store.mjs'
 export const finishedOps = new Set(['succeeded','failed','unknown','rejected','cancelled'])
 
 export class MailCommandExecutor {
-  constructor(store, connections, {prepare = prepareMailCommand, execute = executeMailCommand, resolveInput, onSettled, maxPending = 256} = {}) {
-    Object.assign(this, {store, connections, prepare, execute, resolveInput, onSettled, maxPending})
+  constructor(store, connections, {prepare = prepareMailCommand, execute = executeMailCommand, resolveInput, onSettled, readAsset, assertAsset, assertCurrent, maxPending = 256} = {}) {
+    Object.assign(this, {store, connections, prepare, execute, resolveInput, onSettled, readAsset, assertAsset, assertCurrent, maxPending})
   }
   metadata(mailboxId, epoch) {
+    this.assertCurrent?.()
     const c = this.connections.get(mailboxId)
     requireThat(c?.kind === 'mail' && c.status === 'active', 'mailbox_unavailable', 403)
     if (epoch !== undefined) this.connections.assertEpoch(mailboxId, epoch)
     return c
   }
-  async context(mailboxId, epoch) {
+  async context(mailboxId, epoch,scope={}) {
     const c = this.metadata(mailboxId, epoch)
     const accessToken = await this.connections.credential(mailboxId, c.epoch)
     this.metadata(mailboxId, c.epoch)
-    return {mailboxId,epoch:c.epoch, credential:{provider:c.provider, scopes:c.scopes, actions:c.actions, accessToken}}
+    return {mailboxId,epoch:c.epoch,
+      ...(this.readAsset ? {readAsset:(id,options)=>this.readAsset(id,{...options,...scope})} : {}),
+      ...(this.assertAsset ? {assertAsset:id=>this.assertAsset(id,scope)} : {}),credential:{provider:c.provider, scopes:c.scopes, actions:c.actions, accessToken}}
   }
   authorize(meta, action) {
     const cap = mailCapabilities(meta).find(item => item.action === action)
@@ -27,20 +31,20 @@ export class MailCommandExecutor {
     requireThat(cap.authorized, 'scope_required', 403)
     requireThat(meta.actions.includes(action), 'action_not_granted', 403)
   }
-  async plan(input, {mailboxId, epoch, scheduledAt, expectedRevision, expectedProviderVersion, signal}) {
+  async plan(input, {mailboxId, epoch, scheduledAt, expectedRevision, expectedProviderVersion, signal, assetIds, mailboxIds}) {
     const meta = this.metadata(mailboxId, epoch)
     input = this.resolveInput ? this.resolveInput(mailboxId,input) : input
     this.authorize(meta, input?.action)
     requireThat(scheduledAt === undefined || (Number.isSafeInteger(scheduledAt) && scheduledAt >= 0), 'invalid_schedule')
     requireThat(expectedRevision === undefined || (Number.isSafeInteger(expectedRevision) && expectedRevision >= 0), 'invalid_revision')
-    const context = await this.context(mailboxId, meta.epoch)
+    const context = await this.context(mailboxId, meta.epoch,{assetIds,mailboxIds})
     requireThat(expectedProviderVersion === undefined ||
       (typeof expectedProviderVersion === 'string' && expectedProviderVersion.length > 0 && expectedProviderVersion.length <= 2048),'invalid_provider_version')
     const prepared = await withDeadline(60000,signal,deadline => this.prepare(input,{...context,expectedProviderVersion,signal:deadline}))
     this.metadata(mailboxId, meta.epoch)
     const resourceKey = JSON.stringify([mailboxId, prepared.resource])
     this.checkRevision(resourceKey, expectedRevision)
-    return {mailboxId, epoch:meta.epoch, prepared, resourceKey, scheduledAt, expectedRevision}
+    return {mailboxId, epoch:meta.epoch, prepared, resourceKey, scheduledAt, expectedRevision,assetIds,mailboxIds}
   }
   checkRevision(key, expected) {
     const rev = this.store.one('SELECT revision FROM revisions WHERE resource=?', key)?.revision || 0
@@ -128,7 +132,7 @@ export class MailCommandExecutor {
     if (op.state !== 'queued' || Math.max(op.retryAt||0,op.scheduledAt||0)>Date.now()) return
     let context
     try {
-      context = await this.context(op.mailboxId, op.epoch)
+      context = await this.context(op.mailboxId, op.epoch,{assetIds:op.assetIds,mailboxIds:op.mailboxIds})
       op = this.store.getOp(id)
       if (op.state !== 'queued') return
       this.authorize(this.metadata(op.mailboxId, op.epoch), op.prepared.action)
@@ -147,6 +151,8 @@ export class MailCommandExecutor {
     const started = Date.now()
     try {
       const beforeWrite = () => {
+        this.assertCurrent?.(op)
+        assertFrozenAssetReferences(context,op.prepared)
         this.authorize(this.metadata(op.mailboxId, op.epoch), op.prepared.action)
         if (op.taskId) {
           const t = this.store.getTask(op.taskId)

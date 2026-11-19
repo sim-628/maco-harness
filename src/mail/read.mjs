@@ -117,7 +117,7 @@ function applyGraphCursor(query, value) {
 async function listDrafts(ctx,input) {
   keys(input,['limit','cursor']);
   const limit=input.limit ?? maxResults;
-  if (!Number.isInteger(limit) || limit<1 || limit>maxResults) throw fault('invalid_input');
+  if (!Number.isInteger(limit) || limit<1 || limit>(ctx.clientPage ? 50 : maxResults)) throw fault('invalid_input');
   const cursor=string(input.cursor ?? '', 'cursor',4096,true);
   const gmail=ctx.credential.provider==='gmail';
   const prefix=gmail?'gmail-drafts:':'graph-drafts:';
@@ -170,7 +170,7 @@ async function search(ctx,input) {
   keys(input,['query','limit','cursor','filters']);
   const q = string(input.query ?? '','query',2048,true);
   const limit = input.limit ?? maxResults;
-  if (!Number.isInteger(limit) || limit<1 || limit>maxResults) throw fault('invalid_input');
+  if (!Number.isInteger(limit) || limit<1 || limit>(ctx.clientPage ? 50 : maxResults)) throw fault('invalid_input');
   const cursor = string(input.cursor ?? '','cursor',4096,true);
   const filters = input.filters || {};
   keys(filters,['from','after','before','unread','folderId']);
@@ -186,9 +186,15 @@ async function search(ctx,input) {
     if (filters.unread != null) terms.push(filters.unread ? 'is:unread' : 'is:read');
     const {data} = await request(ctx,'messages',{query:{q:terms.join(' '),maxResults:limit,pageToken:cursor || undefined,labelIds:filters.folderId,includeSpamTrash:true}});
     const matches = [];
-    for (const item of (data?.messages || []).slice(0,limit)) {
-      const response = await request(ctx,messagePath(item.id),{query:{format:'metadata',fields:'id,threadId,historyId,labelIds,snippet,internalDate,payload(headers)'}});
-      matches.push(gmailView(ctx,response.data,false));
+    const listed=(data?.messages || []).slice(0,limit);
+    // Bound provider concurrency while avoiding a serial GET for every row.
+    for (let offset=0;offset<listed.length;offset+=5) {
+      const page=await Promise.all(listed.slice(offset,offset+5).map(async item=>{
+        const response=await request(ctx,messagePath(item.id),{query:{format:'metadata',fields:'id,threadId,historyId,labelIds,snippet,internalDate,payload(headers)'}});
+        if(response.data?.id!==item.id) throw fault('invalid_provider_response');
+        return gmailView(ctx,response.data,false);
+      }));
+      matches.push(...page);
     }
     return {matches,nextCursor:data?.nextPageToken || null};
   }
@@ -210,7 +216,7 @@ async function search(ctx,input) {
     (!filters.after || Date.parse(m.receivedDateTime)>=Date.parse(filters.after)) &&
     (!filters.before || Date.parse(m.receivedDateTime)<Date.parse(filters.before)) &&
     (filters.unread == null || m.isRead===!filters.unread)
-  )).map(m=>graphView(ctx,m));
+  )).map(({body,...metadata})=>graphView(ctx,metadata));
   return {matches,nextCursor:graphCursor(data?.['@odata.nextLink'],path)};
 }
 

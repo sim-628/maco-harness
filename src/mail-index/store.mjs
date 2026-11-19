@@ -3,6 +3,8 @@ import {validId} from '../mail/common.mjs';
 
 const stablePattern=/^mail_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const schema=[
+  'CREATE TABLE IF NOT EXISTS mail_index_changes (seq INTEGER PRIMARY KEY AUTOINCREMENT,mailbox TEXT NOT NULL,message TEXT NOT NULL,data TEXT NOT NULL)',
+  'CREATE INDEX IF NOT EXISTS mail_index_changes_mailbox ON mail_index_changes(mailbox,seq)',
   `CREATE TABLE IF NOT EXISTS mail_index (n INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,mailbox TEXT NOT NULL,providerId TEXT NOT NULL,received INTEGER NOT NULL,subject TEXT NOT NULL,sender TEXT NOT NULL,snippet TEXT NOT NULL,folder TEXT,unread INTEGER NOT NULL,deleted INTEGER NOT NULL DEFAULT 0,syncSeen TEXT NOT NULL DEFAULT '',data TEXT NOT NULL,UNIQUE(mailbox,providerId))`,
   'CREATE INDEX IF NOT EXISTS mail_index_date ON mail_index(mailbox,deleted,received DESC,n DESC)',
   'CREATE INDEX IF NOT EXISTS mail_index_folder ON mail_index(mailbox,folder,deleted,received DESC)',
@@ -63,13 +65,18 @@ export class MessageIndexStore {
         this.store.rows('INSERT INTO mail_index_fts(id,mailbox,subject,sender,snippet) VALUES (?,?,?,?,?)',id,mailbox,subject,sender,snippet);
       }
       this.store.rows('UPDATE mail_index_meta SET version=version+1 WHERE mailbox=?',mailbox);
+      const oldData=prior ? JSON.parse(prior.data) : null;
+      if (oldData) delete oldData.indexedAt;
+      const {indexedAt,...currentData}=data;
+      if (!prior || prior.deleted || JSON.stringify(oldData)!==JSON.stringify(currentData)) this.change(mailbox,id,{messageId:id,deleted:false,metadata:{...data,citation:{mailboxId:mailbox,messageId:id},mailMessageId:id,contentCoverage:'snippet'}});
       return this.public(this.store.one('SELECT * FROM mail_index WHERE id=?',id));
     });
   }
   tombstone(mailbox,providerId) {
     this.store.tx(()=>{
       const row=this.store.one('SELECT * FROM mail_index WHERE mailbox=? AND providerId=?',mailbox,providerId);
-      if(!row)return;
+      if(!row || row.deleted)return;
+      this.change(mailbox,row.id,{messageId:row.id,deleted:true});
       this.store.rows("UPDATE mail_index SET deleted=1,subject='',sender='',snippet='',data=? WHERE id=?",JSON.stringify({deleted:true}),row.id);
       this.store.rows('DELETE FROM mail_index_fts WHERE id=?',row.id);
       this.store.rows('UPDATE mail_index_meta SET version=version+1 WHERE mailbox=?',mailbox);
@@ -84,6 +91,7 @@ export class MessageIndexStore {
   }
   clear(mailbox) {
     this.store.tx(()=>{
+      this.store.rows('DELETE FROM mail_index_changes WHERE mailbox=?',mailbox);
       this.store.rows('DELETE FROM mail_index_fts WHERE mailbox=?',mailbox);
       this.store.rows('DELETE FROM mail_index WHERE mailbox=?',mailbox);
       this.store.rows('DELETE FROM mail_index_meta WHERE mailbox=?',mailbox);
@@ -102,6 +110,19 @@ export class MessageIndexStore {
     return {source:'index',bodySearchCoverage:'snippet_only',historyComplete:!!job?.complete,
       after:job?.after || null,folders:job?.provider==='outlook' ? job.folders.map(f=>f.id) : null,
       syncedAt:job?.syncedAt || null,syncState:job?.phase || 'not_started',fullTextSearched:false};
+  }
+  change(mailbox,message,value) {
+    const {seq}=this.store.one('INSERT INTO mail_index_changes(mailbox,message,data) VALUES (?,?,?) RETURNING seq',mailbox,message,JSON.stringify(value));
+    this.store.event('mail.index.changed',{mailboxId:mailbox,messageId:message,deleted:value.deleted,changeCursor:seq});
+  }
+  changes(mailbox,{after=0,limit=100}={}) {
+    if (!Number.isSafeInteger(after) || after<0 || !Number.isSafeInteger(limit) || limit<1 || limit>100) throw fault('invalid_cursor');
+    const head=this.store.one('SELECT COALESCE(MAX(seq),0) AS seq FROM mail_index_changes WHERE mailbox=?',mailbox).seq;
+    if(after>head) throw fault('index_cursor_changed');
+    const rows=this.store.rows('SELECT seq,data FROM mail_index_changes WHERE mailbox=? AND seq>? ORDER BY seq LIMIT ?',mailbox,after,limit+1);
+    const selected=rows.slice(0,limit);
+    return {mailboxId:mailbox,changes:selected.map(row=>({seq:row.seq,...JSON.parse(row.data)})),cursor:selected.at(-1)?.seq ?? after,
+      hasMore:rows.length>limit,coverage:this.coverage(mailbox)};
   }
   query(mailbox,input,{now=Date.now(),maxAge=120_000}={}) {
     const filters=input.filters || {},coverage=this.coverage(mailbox),meta=this.meta(mailbox);

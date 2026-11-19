@@ -26,12 +26,16 @@ export class ConnectionStore {
   #cipher;
   #env;
   #refreshing = new Map();
+  #transact;
 
-  constructor(storage, env) {
+  constructor(storage, env, {transaction} = {}) {
     this.#storage = storage;
+    this.#transact = transaction || (fn => storage.transactionSync(fn));
     this.#env = env;
     this.#sql = storage.sql;
-    storage.transactionSync(() => {
+    this.#transact(() => {
+      this.#sql.exec('CREATE TABLE IF NOT EXISTS vault_lifecycle (singleton INTEGER PRIMARY KEY,epoch INTEGER NOT NULL)');
+      this.#sql.exec('INSERT OR IGNORE INTO vault_lifecycle VALUES (1,1)');
       this.#sql.exec('CREATE TABLE IF NOT EXISTS vault_identity (singleton INTEGER PRIMARY KEY, binding TEXT NOT NULL)');
       this.#sql.exec('INSERT OR IGNORE INTO vault_identity VALUES (1,?)', crypto.randomUUID());
       this.#sql.exec(`CREATE TABLE IF NOT EXISTS connections (
@@ -46,6 +50,17 @@ export class ConnectionStore {
     });
     const vault = this.#first('SELECT binding FROM vault_identity WHERE singleton=1');
     this.#cipher = new VaultCipher(env.CONNECTION_ENCRYPTION_KEY, vault.binding);
+  }
+
+  #controlEpoch() { return this.#first('SELECT epoch FROM vault_lifecycle WHERE singleton=1').epoch; }
+  #assertControl(epoch) { if (epoch!==this.#controlEpoch()) throw failure('account_generation_changed',409); }
+  fence({revokeConnections=false}={}) {
+    return this.#transact(()=>{
+      this.#sql.exec('UPDATE vault_lifecycle SET epoch=epoch+1 WHERE singleton=1');
+      this.#sql.exec('DELETE FROM mail_oauth');
+      if (revokeConnections) this.#sql.exec("UPDATE connections SET status='revoked',epoch=epoch+1,sealed=NULL,generation=hex(randomblob(16)),actions='[]',scopes='[]'");
+      return {epoch:this.#controlEpoch()};
+    });
   }
 
   #first(sql, ...args) { return this.#sql.exec(sql, ...args).toArray()[0]; }
@@ -78,7 +93,9 @@ export class ConnectionStore {
     return metadata(row);
   }
 
-  async putModel({ id, expectedEpoch, provider, apiKey, baseUrl }) {
+  async putModel({ id, expectedEpoch, provider, apiKey, baseUrl },{assertAuthorized}={}) {
+    assertAuthorized?.();
+    const controlEpoch=this.#controlEpoch();
     if (!modelProviders.has(provider)) throw failure('unknown_model_provider');
     if (typeof apiKey !== 'string' || !/^[\x21-\x7e]{1,8192}$/.test(apiKey)) throw failure('invalid_api_key');
     const prior = id !== undefined ? this.#existing(id, expectedEpoch, 'model', provider) : null;
@@ -88,7 +105,9 @@ export class ConnectionStore {
     else if (baseUrl !== undefined) throw failure('preset_endpoint_fixed');
     const key = id ?? crypto.randomUUID();
     const sealed = await this.#cipher.seal(['model', provider, key], { apiKey });
-    return this.#storage.transactionSync(() => {
+    return this.#transact(() => {
+      this.#assertControl(controlEpoch);
+      assertAuthorized?.();
       if (id !== undefined) {
         this.#existing(id, expectedEpoch, 'model', provider);
         this.#sql.exec("UPDATE connections SET sealed=?,generation=?,status='active',epoch=epoch+1 WHERE id=?", sealed, nonce(), key);
@@ -100,7 +119,9 @@ export class ConnectionStore {
     });
   }
 
-  async beginOAuth({ id, expectedEpoch, provider, actions = [] }) {
+  async beginOAuth({ id, expectedEpoch, provider, actions = [] },{assertAuthorized}={}) {
+    assertAuthorized?.();
+    const controlEpoch=this.#controlEpoch();
     const allowed = validateActions(provider, actions);
     if (id !== undefined) this.#existing(id, expectedEpoch, 'mail', provider);
     else if (expectedEpoch !== undefined) throw failure('connection_changed', 409);
@@ -110,7 +131,9 @@ export class ConnectionStore {
       actions: allowed, state, codeChallenge: await challenge(verifier),
     });
     const sealed = await this.#cipher.seal(['oauth', state], { id, expectedEpoch, provider, actions: allowed, verifier, redirect, scopes });
-    this.#storage.transactionSync(() => {
+    this.#transact(() => {
+      this.#assertControl(controlEpoch);
+      assertAuthorized?.();
       this.#sql.exec('DELETE FROM mail_oauth WHERE expires<=?', Date.now());
       if (id !== undefined) this.#existing(id, expectedEpoch, 'mail', provider);
       this.#sql.exec('INSERT INTO mail_oauth VALUES (?,?,?)', state, Date.now() + oauthLifetime, sealed);
@@ -118,10 +141,12 @@ export class ConnectionStore {
     return { state, authorizationUrl };
   }
 
-  async completeOAuth({ state, code }) {
+  async completeOAuth({ state, code },{assertAuthorized}={}) {
+    assertAuthorized?.();
+    const controlEpoch=this.#controlEpoch();
     if (typeof state !== 'string' || !/^[\w-]{43}$/.test(state) || typeof code !== 'string' || !code || code.length > 8192) throw failure('invalid_oauth_callback');
     // Consume before any provider I/O, so even simultaneous callback deliveries redeem once.
-    const saved = this.#storage.transactionSync(() => {
+    const saved = this.#transact(() => {
       const row = this.#first('SELECT expires,sealed FROM mail_oauth WHERE state=?', state);
       this.#sql.exec('DELETE FROM mail_oauth WHERE state=?', state);
       return row;
@@ -133,7 +158,9 @@ export class ConnectionStore {
     const { secret, scopes, accountId } = await redeemCode(provider, this.#env, code, txn);
     const key = id ?? crypto.randomUUID();
     const sealed = await this.#cipher.seal(['mail', provider, key], secret);
-    return this.#storage.transactionSync(() => {
+    return this.#transact(() => {
+      this.#assertControl(controlEpoch);
+      assertAuthorized?.();
       if (id !== undefined) {
         const old = this.#existing(id, expectedEpoch, 'mail', provider);
         if (old.account_id !== accountId) throw failure('mailbox_identity_changed', 409);
@@ -149,7 +176,7 @@ export class ConnectionStore {
   }
 
   updateActions(id, actions, expectedEpoch) {
-    return this.#storage.transactionSync(() => {
+    return this.#transact(() => {
       const current = this.assertEpoch(id, expectedEpoch);
       if (current.kind !== 'mail') throw failure('not_a_mail_connection');
       const next = validateActions(current.provider, actions);
@@ -161,7 +188,7 @@ export class ConnectionStore {
   }
 
   revoke(id, expectedEpoch) {
-    return this.#storage.transactionSync(() => {
+    return this.#transact(() => {
       const row = this.#row(id);
       if (expectedEpoch !== undefined) sameEpoch(row, expectedEpoch);
       if (row.status === 'active') {
@@ -217,7 +244,7 @@ export class ConnectionStore {
       throw error;
     }
     const sealed = await this.#cipher.seal(['mail', row.provider, row.id], result.secret);
-    return this.#storage.transactionSync(() => {
+    return this.#transact(() => {
       const current = this.#row(row.id);
       if (current.status !== 'active' || current.generation !== row.generation) throw failure('connection_changed', 409);
       const scopes = JSON.stringify(result.scopes);

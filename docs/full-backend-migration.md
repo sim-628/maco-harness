@@ -1,10 +1,14 @@
 # Maco 完整后端迁移方案
 
-状态：**目标架构与验收范围，尚未实现或部署。** 本文不代表当前 v0.3 已能替换旧生产服务。
+**状态更新（2026-11-19）：本文保留 v0.3 审计形成的“沿用旧生产身份、原址接替完整后端”历史方案，供后续生产迁移参考。它不是当前 v0.4 的部署指南。** 用户现已选择先独立部署新的 `maco-harness`，再改造 App；当前已实现能力与条件以 [README](../README.md)、[客户端协议](protocol.md)、[Cloudflare 部署](cloudflare-deploy.md)为准。
+
+v0.4 已有自有 Harness、多个 Task/服务端会话聚合、R2 资产、受限 MCP、可选托管子任务、通知与账户清理。当前没有旧数据/凭据自动导入器、旧 `/v1/chat` 兼容门面或 `AgentAccount` 原址组合构建，不会自动继承 `maco-agent-cloud` 的资源；本仓库也尚未替用户完成部署或客户端切流。
+
+**下文的“当前 v0.3”“拟实现”“尚未实现”及矩阵是固定历史基线的审查结论。** 保留它们用于评估旧能力如何接替，不代表 v0.4 所列新功能仍全部缺失。尤其第 2 节的保留旧 Worker/namespace 建议属于另行设计和验收的迁移，不可直接套用当前独立部署配置。
 
 代码基线：旧 [maco-mail@d1b6dfc](https://github.com/sim-628/maco-mail/tree/d1b6dfc6c77545d60092e6c8f42db43f882f34ff)，新 [maco-harness@fae8b5e](https://github.com/sim-628/maco-harness/tree/fae8b5e0731d1e2d0fe8fd50bdb1ac7915d5b06f)。核对日期：2026-11-19。
 
-本方案用于“新仓库承接完整 Maco 后端”的目标。[原迁移说明](migration.md)仍描述当前独立 Harness 的接入方法和限制。现有 `wrangler.jsonc` 仍只部署独立 `MacoAgent`，不能改一个 Worker 名称就覆盖旧生产服务。
+本方案用于评估“新仓库承接旧生产后端”的完整性目标。[原迁移说明](migration.md)保留操作归属、数据边界与切流原则。当前 `wrangler.jsonc` 部署独立 `MacoAgent` 与 `NotificationRegistry`，不能改一个 Worker 名称就覆盖旧生产服务。
 
 2026-11-19 产品决策更新：用户确认邮件摘要与分类已采用端侧 AI；云端承接结果同步，不重建这两项推理。复杂附件和计算任务允许按需委派托管 Agent API。详细边界见[附件理解与复杂任务执行策略](attachments-and-managed-execution.md)。以下目标已按这两项决定修正。
 

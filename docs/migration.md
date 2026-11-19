@@ -1,12 +1,12 @@
 # 从旧 Maco / OpenAI 托管 Agent 迁移
 
-目标是把常规 Agent 循环、工具约束、邮箱操作和持久状态迁入本仓库的 Cloudflare Worker / 每用户 Durable Object。日常路径使用自有 Harness，邮件修改统一在云端执行。原 App 可以继续保留一个个人助理入口；执行层使用多个独立 Task 和同一用户事件流。
+**状态更新（2026-11-19）：当前交付是 v0.4 独立 `maco-harness` 后端，先部署新 Worker，再改造 App。** 当前功能与参数以 [README](../README.md)、[客户端协议](protocol.md)、[Cloudflare 部署](cloudflare-deploy.md)为准。新的 Harness、资产/MCP/托管执行/通知及账户生命周期已有代码实现；本仓库尚未替用户部署，也没有完成旧 App 切流。
 
-2026-11-19 更新的目标允许复杂任务按需委派托管 Agent API，并明确邮件摘要/分类由端侧 AI 完成；见[附件理解与复杂任务执行策略](attachments-and-managed-execution.md)。本文下述独立 v0.3 的接口与能力仍不包含该委派实现。
+**阅读方式：以下正文保留 v0.3 基线的迁移原则与历史接入步骤。** 其中“当前能力”“尚未实现”和旧字段示例均属于当时基线，不能覆盖上述三份 v0.4 主文档。端侧摘要/分类、按需复杂任务委派的设计依据见[附件策略](attachments-and-managed-execution.md)；生产原址接替的历史目标见[完整后端迁移方案](full-backend-migration.md)，不是当前部署命令。
 
-本仓库是新后端，**尚未替你完成 maco-mail 客户端切流，也没有旧会话、凭据或任务的自动导入接口**。参数与响应以[客户端协议](protocol.md)为准，环境配置见[Cloudflare 部署](cloudflare-deploy.md)。
+**当前没有旧会话、OAuth 凭据、任务、待发邮件或附件的自动导入器，也不兼容旧 `/v1/chat`。** 使用新的用户 DO 和通知 registry，不能直接覆盖 `maco-agent-cloud`、复用其 namespace，或只修改旧 App 的 URL。真实账号切流仍需明确唯一执行者、处理旧待发队列，并在 App 中关闭旧云端/设备直写路径。
 
-若目标是保留旧 Worker 的全部能力并最终收敛为一个完整 Maco 后端，采用[完整后端迁移方案](full-backend-migration.md)。该方案规划在完整兼容构建验收后沿用生产 `AgentAccount` 与服务身份；当前 v0.3 尚未实现组合运行，下面的独立部署步骤不能用来直接覆盖旧生产 Worker。
+下文的操作归属、未知发送结果、身份映射、回滚和逐账号验收原则仍适用于后续生产迁移；它们不表示已经自动执行了迁移。
 
 ## 1. 先确定每项操作由谁执行
 

@@ -1,4 +1,4 @@
-import {attachmentLimit, b64, bodyLimit, digest, encoder, request, string} from './common.mjs';
+import {attachmentLimit, b64, bodyLimit, digest, encoder, keys, request, string} from './common.mjs';
 import {fault} from './policy.mjs';
 import {downloadAttachment, readMessage} from './read.mjs';
 
@@ -26,10 +26,42 @@ export async function mailboxSender(ctx) {
 }
 
 export async function freezeAttachment(ctx,ref,max=attachmentLimit) {
+  if (ref && Object.hasOwn(ref,'assetId')) {
+    keys(ref,['assetId']);
+    if (typeof ref.assetId !== 'string' || !/^asset_[a-f0-9-]{36}$/.test(ref.assetId)) throw fault('invalid_asset_reference');
+    if (typeof ctx.readAsset !== 'function') throw fault('asset_reader_unavailable');
+    const {asset,bytes} = await ctx.readAsset(ref.assetId,{maxBytes:max,signal:ctx.signal});
+    if (!asset || asset.id !== ref.assetId || !(bytes instanceof Uint8Array) || !Number.isSafeInteger(asset.size) ||
+      asset.size !== bytes.length || bytes.length > max || bytes.length < 1) throw fault('invalid_asset_attachment');
+    const name = string(asset.name,'attachment name',255,true);
+    const mimeType = typeof asset.mimeType === 'string' && /^[a-z\d!#$&^_.+-]+\/[a-z\d!#$&^_.+-]+$/i.test(asset.mimeType)
+      ? asset.mimeType : null;
+    if (!mimeType) throw fault('invalid_asset_attachment');
+    const sha256 = await digest(bytes);
+    if (sha256 !== asset.sha256) throw fault('asset_integrity_error');
+    // This manifest is shown for approval; the provider payload below contains
+    // the exact bytes approved. Dispatch revalidates permission via the helper
+    // without downloading or substituting newer file content.
+    return {meta:{assetId:asset.id,source:{assetId:asset.id,provenance:asset.source},name,mimeType,size:bytes.length,sha256},data:b64(bytes)};
+  }
   const {ref:source,bytes} = await downloadAttachment(ctx,ref,max);
   const name = string(source.name,'attachment name',255,true);
   const mimeType = /^[a-z\d!#$&^_.+-]+\/[a-z\d!#$&^_.+-]+$/i.test(source.mimeType) ? source.mimeType : 'application/octet-stream';
   return {meta:{source,name,mimeType,size:bytes.length,sha256:await digest(bytes)},data:b64(bytes)};
+}
+
+// Call from the executor's synchronous beforeWrite fence, after any async
+// provider preflight. A deleted/revoked asset must not remain sendable merely
+// because its bytes were frozen earlier for approval.
+export function assertFrozenAssetReferences(ctx,prepared) {
+  const attachments = [...(prepared.summary?.attachments || []),...(prepared.summary?.attachment ? [prepared.summary.attachment] : [])];
+  for (const frozen of attachments) {
+    if (!frozen?.assetId) continue;
+    if (typeof ctx.assertAsset !== 'function') throw fault('asset_authorization_unavailable');
+    const current = ctx.assertAsset(frozen.assetId);
+    if (!current || current.id !== frozen.assetId || current.sha256 !== frozen.sha256 || current.size !== frozen.size ||
+      current.name !== frozen.name || current.mimeType !== frozen.mimeType) throw fault('asset_changed');
+  }
 }
 
 export async function compose(ctx,input) {
