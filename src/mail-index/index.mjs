@@ -17,6 +17,7 @@ export class MailIndexService {
     const value=structuredClone(input);
     if(value.messageId)value.messageId=this.index.providerId(mailboxId,value.messageId);
     const resolveRef=ref=>{
+      if(ref && Object.hasOwn(ref,'assetId')) return ref;
       if(ref.mailboxId!==mailboxId)throw fault('mailbox_mismatch');
       return {...ref,messageId:this.index.providerId(mailboxId,ref.messageId)};
     };
@@ -44,12 +45,12 @@ export class MailIndexService {
     this.store.tx(()=>this.index.saveSync(state));
     return this.sync.status(mailboxId);
   }
-  validateSearch(input) {
+  validateSearch(input,max=8) {
     keys(input,['query','scope','filters','limit','cursor']);
     if(input.scope!==undefined && !['metadata','fulltext'].includes(input.scope))throw fault('invalid_input');
     string(input.query || '','query',2048,true);
     string(input.cursor || '','cursor',4096,true);
-    if(input.limit!==undefined && (!Number.isInteger(input.limit)||input.limit<1||input.limit>8))throw fault('invalid_input');
+    if(input.limit!==undefined && (!Number.isInteger(input.limit)||input.limit<1||input.limit>max))throw fault('invalid_input');
     const filters=input.filters || {};
     keys(filters,['from','after','before','unread','folderId']);
     if(filters.from!=null)string(filters.from,'from',320,true);
@@ -87,7 +88,7 @@ export class MailIndexService {
     this.index.meta(ctx.mailboxId,ctx.credential.provider);
     const epoch=this.index.meta(ctx.mailboxId).epoch;
     if(name==='mail_search') {
-      this.validateSearch(input);
+      this.validateSearch(input,ctx.clientPage ? 50 : 8);
       const localCursor=String(input.cursor || '').startsWith('index:');
       if(input.scope==='metadata' && (!input.cursor || localCursor)) {
         const result=this.index.query(ctx.mailboxId,input,{now:this.now()});

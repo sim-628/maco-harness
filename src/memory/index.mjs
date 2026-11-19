@@ -43,8 +43,8 @@ const utf8 = new TextEncoder()
 // One instance per trusted user DO. This module never accepts an owner ID from
 // tools or model output, and it has no global or cross-DO memory cache.
 export class MemoryService {
-  constructor(store,{connections,stream = streamStep,now = Date.now} = {}) {
-    Object.assign(this,{store,connections,stream,now})
+  constructor(store,{connections,stream = streamStep,now = Date.now,assertCurrent} = {}) {
+    Object.assign(this,{store,connections,stream,now,assertCurrent})
     store.tx(() => {
       for (const sql of schema) store.rows(sql)
       store.rows('INSERT OR IGNORE INTO memory_state VALUES (1,?)',JSON.stringify({
@@ -163,7 +163,7 @@ export class MemoryService {
         const pending=this.store.one("SELECT COUNT(*) AS count FROM memory_jobs WHERE state IN ('queued','running')").count
         if (pending<16) this.store.rows('INSERT OR IGNORE INTO memory_jobs VALUES (?,?,\'queued\',?,0,?)',id,source.n,this.now(),JSON.stringify({
             id,taskId,messageId:source.message.messageId,profile:binding.profile,modelEpoch:binding.modelEpoch,memoryEpoch:state.epoch,
-            createdAt:this.now(),usage:null
+            authorizationSession:binding.authorizationSession,createdAt:this.now(),usage:null
           }))
         else this.store.event('memory.extraction_skipped',{sourceMessageId:source.message.messageId,reason:'queue_capacity'})
       }
@@ -171,14 +171,14 @@ export class MemoryService {
     })
   }
   searchHistory(query,options={}) { return this.history.searchHistory(query,options) }
-  context(taskId,{query,maxBytes=6000,mailboxId,beforeN} = {}) {
+  context(taskId,{query,maxBytes=6000,mailboxId,allowedMailboxes,allowedConnectors,beforeN} = {}) {
     requireThat(Number.isSafeInteger(maxBytes) && maxBytes>=256 && maxBytes<=16000,'invalid_memory_budget')
     if (!this.state().enabled) return {facts:[],preferences:[],relatedHistory:[],coverage:{enabled:false}}
     if (query===undefined) {
       const row=this.store.one("SELECT data FROM messages WHERE task=? AND json_extract(data,'$.role')='user' ORDER BY n DESC LIMIT 1",taskId)
       query=row ? JSON.parse(row.data).content : ''
     }
-    const {results,coverage,capped}=this.searchHistory(query,{excludeTaskId:taskId,mailboxId,beforeN})
+    const {results,coverage,capped}=this.searchHistory(query,{excludeTaskId:taskId,mailboxId,allowedMailboxes,allowedConnectors,beforeN})
     const value={facts:[],preferences:[],relatedHistory:[],coverage:{...coverage,enabled:true,capped}}
     const include=(list,item,budget=maxBytes)=>{
       list.push(item)
@@ -225,7 +225,8 @@ export class MemoryService {
         const data=JSON.parse(row.data)
         const state=row.attempts>=2?'failed':'queued'
         this.store.rows('UPDATE memory_jobs SET state=?,due=? WHERE id=?',state,this.now(),row.id)
-        this.store.event('memory.extraction_interrupted',{jobId:row.id,taskId:data.taskId,usage:data.usage ?? null})
+        this.store.event('memory.extraction_interrupted',{jobId:row.id,taskId:data.taskId,usage:data.usage ?? null,
+          attempt:row.attempts,modelProfile:data.profile})
       }
     })
   }
@@ -247,13 +248,15 @@ export class MemoryService {
     const claimed=this.store.tx(()=>{
       const value=this.store.one("UPDATE memory_jobs SET state='running',attempts=attempts+1 WHERE id=? AND state='queued' RETURNING attempts",row.id)
       if (value) {
+        job.usage=null
+        this.store.rows('UPDATE memory_jobs SET data=? WHERE id=?',JSON.stringify(job),job.id)
         this.store.rows('INSERT INTO memory_daily_budget VALUES (?,1) ON CONFLICT(day) DO UPDATE SET attempts=attempts+1',day)
         this.store.rows('DELETE FROM memory_daily_budget WHERE day<?',day-31)
       }
       return value
     })
     if (!claimed) return false
-    this.store.event('memory.extraction_started',{jobId:job.id,taskId:job.taskId,payer:'user_connection',attempt:claimed.attempts})
+    this.store.event('memory.extraction_started',{jobId:job.id,taskId:job.taskId,payer:'user_connection',attempt:claimed.attempts,modelProfile:job.profile})
     try {
       requireThat(this.connections,'memory_model_not_configured')
       this.connections.assertEpoch(job.profile.connectionId,job.modelEpoch)
@@ -261,6 +264,7 @@ export class MemoryService {
         ? await this.connections.modelCredential(job.profile.connectionId,job.modelEpoch)
         : {apiKey:await this.connections.credential(job.profile.connectionId,job.modelEpoch)}
       const assertActive=()=>{
+        this.assertCurrent?.(job)
         this.connections.assertEpoch(job.profile.connectionId,job.modelEpoch)
         requireThat(this.state().epoch===job.memoryEpoch &&
           this.store.one('SELECT state FROM memory_jobs WHERE id=?',job.id)?.state==='running',
@@ -301,14 +305,14 @@ export class MemoryService {
           if (added) this.store.event('memory.proposed',{proposal})
         }
         this.store.rows("UPDATE memory_jobs SET state='completed',data=? WHERE id=?",JSON.stringify(job),job.id)
-        this.store.event('memory.extraction_finished',{jobId:job.id,taskId:job.taskId,status:'completed',usage:job.usage})
+        this.store.event('memory.extraction_finished',{jobId:job.id,taskId:job.taskId,status:'completed',usage:job.usage,attempt:claimed.attempts,modelProfile:job.profile})
       })
     } catch (error) {
       const cancelled=this.state().epoch!==job.memoryEpoch || this.store.one('SELECT state FROM memory_jobs WHERE id=?',job.id)?.state==='cancelled'
       const retry=!cancelled && Boolean(error.retryable) && claimed.attempts<2
       const status=cancelled?'cancelled':retry?'queued':'failed'
       this.store.rows('UPDATE memory_jobs SET state=?,due=?,data=? WHERE id=?',status,this.now()+30000,JSON.stringify(job),job.id)
-      this.store.event('memory.extraction_finished',{jobId:job.id,taskId:job.taskId,status,
+      this.store.event('memory.extraction_finished',{jobId:job.id,taskId:job.taskId,status,attempt:claimed.attempts,modelProfile:job.profile,
         code:errorCode(error,'memory_extraction_failed'),usage:job.usage})
     }
     return true

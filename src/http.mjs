@@ -17,13 +17,13 @@ export function browserOrigin(request, env) {
 export function preflight(request, origin) {
   requireThat(origin, 'origin_required',403)
   const method = request.headers.get('Access-Control-Request-Method')
-  requireThat(['GET','POST'].includes(method),'method_not_allowed',405)
+  requireThat(['GET','POST','PUT'].includes(method),'method_not_allowed',405)
   const requested = (request.headers.get('Access-Control-Request-Headers') || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean)
-  requireThat(requested.every(h => ['authorization','content-type'].includes(h)), 'cors_header_not_allowed',403)
+  requireThat(requested.every(h => ['authorization','content-type','idempotency-key','x-content-sha256'].includes(h)), 'cors_header_not_allowed',403)
   return new Response(null,{status:204,headers:{
     'Access-Control-Allow-Origin':origin,
-    'Access-Control-Allow-Methods':'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers':'Authorization, Content-Type',
+    'Access-Control-Allow-Methods':'GET, POST, PUT, OPTIONS',
+    'Access-Control-Allow-Headers':'Authorization, Content-Type, Idempotency-Key, X-Content-SHA256',
     'Access-Control-Max-Age':'600',
     'Vary':'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
   }})

@@ -218,14 +218,26 @@ export class HistoryService {
       return {enabled:true,indexedThrough:settings.historyCursor,hasMore:settings.historyCursor<head,sourceLimitBytes:INDEX_BYTES}
     })
   }
-  scopeWhere({callerTaskId,mailboxId,beforeN}={},taskId,after,before) {
+  scopeWhere({callerTaskId,mailboxId,allowedMailboxes,allowedConnectors,beforeN}={},taskId,after,before) {
     const settings=this.state()
     const clauses=['h.indexVersion=?','h.n>?','(h.historyEpoch IS NULL OR h.historyEpoch=?)',
       'NOT EXISTS(SELECT 1 FROM memory_excluded_sources x WHERE x.messageId=h.messageId)']
     const args=[INDEX_VERSION,settings.historyFloor || 0,settings.epoch]
     if (taskId) {clauses.push('h.taskId=?');args.push(taskId)}
     else if(callerTaskId) {clauses.push('h.taskId<>?');args.push(callerTaskId)}
-    if (mailboxId) {clauses.push("EXISTS(SELECT 1 FROM tasks t WHERE t.id=h.taskId AND json_extract(t.data,'$.mailboxId')=?)");args.push(mailboxId)}
+    const mailboxes = allowedMailboxes ?? (mailboxId ? [mailboxId] : undefined)
+    if (mailboxes !== undefined) {
+      clauses.push(`EXISTS(SELECT 1 FROM tasks t WHERE t.id=h.taskId AND NOT EXISTS(
+        SELECT 1 FROM json_each(COALESCE(json_extract(t.data,'$.mailboxIds'),json_array(json_extract(t.data,'$.mailboxId')))) r
+        WHERE r.value IS NOT NULL AND r.value NOT IN (SELECT value FROM json_each(?))))`)
+      args.push(JSON.stringify(mailboxes))
+    }
+    if (allowedConnectors !== undefined) {
+      clauses.push(`EXISTS(SELECT 1 FROM tasks t WHERE t.id=h.taskId AND NOT EXISTS(
+        SELECT 1 FROM json_each(COALESCE(json_extract(t.data,'$.connectorIds'),'[]')) r
+        WHERE r.value NOT IN (SELECT value FROM json_each(?))))`)
+      args.push(JSON.stringify(allowedConnectors))
+    }
     if (beforeN!==undefined && callerTaskId) {clauses.push('(h.taskId<>? OR h.n<?)');args.push(callerTaskId,beforeN)}
     if (after!==undefined) {clauses.push('h.createdAt>=?');args.push(after)}
     if (before!==undefined) {clauses.push('h.createdAt<?');args.push(before)}
@@ -265,17 +277,21 @@ export class HistoryService {
     requireThat(after===undefined || before===undefined || after<before,'invalid_history_time_range')
     return this.query(input.query,{scope,taskId:input.taskId,after,before})
   }
-  searchHistory(query,{excludeTaskId,limit=4,mailboxId,beforeN}={}) {
+  searchHistory(query,{excludeTaskId,limit=4,mailboxId,allowedMailboxes,allowedConnectors,beforeN}={}) {
     requireThat(typeof query==='string' && query.length<=16000,'invalid_memory_query')
     requireThat(Number.isSafeInteger(limit) && limit>0 && limit<=10,'invalid_memory_limit')
-    return this.query(query,{scope:{callerTaskId:excludeTaskId,mailboxId,beforeN},limit,allTerms:false})
+    return this.query(query,{scope:{callerTaskId:excludeTaskId,mailboxId,allowedMailboxes,allowedConnectors,beforeN},limit,allTerms:false})
   }
   source(taskId,messageId,scope={}) {
     const row=this.store.one("SELECT n,task,data FROM messages WHERE task=? AND json_extract(data,'$.messageId')=? ORDER BY n DESC LIMIT 1",taskId,messageId)
     const message=row && JSON.parse(row.data)
-    const mailboxAllowed=!scope.mailboxId || this.store.one("SELECT id FROM tasks WHERE id=? AND json_extract(data,'$.mailboxId')=?",taskId,scope.mailboxId)
+    const taskRow = this.store.one('SELECT data FROM tasks WHERE id=?',taskId)
+    const task = taskRow && JSON.parse(taskRow.data)
+    const allowedMailboxes = scope.allowedMailboxes ?? (scope.mailboxId ? [scope.mailboxId] : undefined)
+    const mailboxAllowed = task && (allowedMailboxes === undefined || (task.mailboxIds || (task.mailboxId ? [task.mailboxId] : [])).every(id=>allowedMailboxes.includes(id)))
+    const connectorsAllowed = task && (scope.allowedConnectors === undefined || (task.connectorIds || []).every(id=>scope.allowedConnectors.includes(id)))
     const beforeAllowed=!(taskId===scope.callerTaskId && scope.beforeN!==undefined && row?.n>=scope.beforeN)
-    requireThat(row && mailboxAllowed && beforeAllowed && this.allowed(message,row.n),'history_source_not_found',404)
+    requireThat(row && mailboxAllowed && connectorsAllowed && beforeAllowed && this.allowed(message,row.n),'history_source_not_found',404)
     const projected=this.project({n:row.n,taskId,message})
     requireThat(projected,'history_source_not_found',404)
     return {n:row.n,taskId,message,...projected}

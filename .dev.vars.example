@@ -9,7 +9,7 @@ ALLOWED_ORIGINS=http://localhost:3000
 # Built-in OpenAI, Anthropic and DeepSeek endpoints do not require this variable.
 MODEL_PROVIDER_HOSTS=
 
-# Per-user admission bounds; execution concurrency remains 2 tasks / 4 writes / 1 maintenance job.
+# Per-user admission bounds; concurrency is 2 tasks / 4 mail writes / 3 maintenance jobs.
 MAX_OPEN_TASKS=32
 MAX_PENDING_OPERATIONS=256
 CONTEXT_INPUT_BYTES=65536
@@ -23,3 +23,40 @@ GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
 MICROSOFT_CLIENT_ID=
 MICROSOFT_CLIENT_SECRET=
+
+# Optional MCP servers: operator allowlist, never a user-supplied arbitrary URL.
+# See src/connectors/README.md for the exact catalog shape and tool permissions.
+MCP_SERVERS={}
+# MCP_OAUTH_REDIRECT_URI=https://your-app.example/oauth/mcp/callback
+# Optional separate 32-byte encryption keys; omit to reuse CONNECTION_ENCRYPTION_KEY.
+# CONNECTOR_ENCRYPTION_KEY=
+# NOTIFICATION_ENCRYPTION_KEY=
+
+# R2 (ASSETS) and Workers AI (AI) are declared in wrangler.jsonc.
+# Text files parse locally; supported binary documents use Workers AI toMarkdown.
+# Explicit OCR is optional and uses a separately billed operator credential.
+DEEPSEEK_OCR_API_KEY=
+# ASSET_AUTO_OCR=deepseek
+
+# Optional complex-task executor. Native mail tasks do not need these.
+# Enable only after setting a model available to this Agents API project.
+HOSTED_AGENT_ENABLED=false
+OPENAI_AGENTS_API_KEY=
+HOSTED_AGENT_MODEL=
+HOSTED_AGENT_PROFILE=document-analysis
+HOSTED_AGENT_EFFORT=medium
+
+# Optional mail-change webhooks. Google Pub/Sub resources must exist first.
+GMAIL_PUBSUB_TOPIC=
+GMAIL_PUBSUB_SUBSCRIPTION=
+GMAIL_PUBSUB_AUDIENCE=
+GMAIL_PUBSUB_SERVICE_ACCOUNT=
+# Use the deployed Worker origin. Graph uses /webhooks/graph.
+NOTIFICATION_BASE_URL=
+
+# Optional private iOS/macOS notifications. Keep private key as a runtime secret.
+APNS_TEAM_ID=
+APNS_KEY_ID=
+APNS_PRIVATE_KEY=
+APNS_TOPIC=
+APNS_ENVIRONMENT=production

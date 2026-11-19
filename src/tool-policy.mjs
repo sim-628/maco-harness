@@ -8,7 +8,10 @@ export function validateTool(schema,value) {
   const pending = [[schema,value]]
   while (pending.length) {
     const [s,v] = pending.pop()
-    if (s.type === 'object') {
+    if (s.oneOf) {
+      const child=s.oneOf.find(candidate=>!validateJsonSchemaValue(candidate,v).length)
+      if (child) pending.push([child,v])
+    } else if (s.type === 'object') {
       for (const [key,child] of Object.entries(s.properties || {})) {
         if (Object.hasOwn(v,key)) pending.push([child,v[key]])
       }

@@ -73,7 +73,7 @@ async function signingKey(issuer, alg, kid) {
   return cache.keys.get(keyId) ?? reject();
 }
 
-export async function verifyOwner(request, env) {
+export async function verifyIdentity(request, env) {
   if (!env.SUPABASE_URL) reject(503);
   let issuer;
   try {
@@ -99,9 +99,14 @@ export async function verifyOwner(request, env) {
     const valid = await crypto.subtle.verify(formats[alg].verify, key, bytes(parts[2]),
       new TextEncoder().encode(parts[0] + '.' + parts[1]));
     if (!valid) reject();
-    return claims.sub;
+    if (claims.session_id !== undefined && (typeof claims.session_id!=='string' || !/^[a-zA-Z0-9_.:@-]{1,128}$/.test(claims.session_id))) reject();
+    if (claims.iat !== undefined && (!Number.isSafeInteger(claims.iat) || claims.iat<0 || claims.iat>now+30)) reject();
+    const tokenHash = claims.session_id ? null : Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(token))),n=>n.toString(16).padStart(2,'0')).join('');
+    return {owner:claims.sub,sessionId:claims.session_id || 'jwt_'+tokenHash,issuedAt:claims.iat || 0,expires:claims.exp};
   } catch (error) {
     if (error?.status === 503) throw error;
     reject();
   }
 }
+
+export async function verifyOwner(request,env) { return (await verifyIdentity(request,env)).owner }
