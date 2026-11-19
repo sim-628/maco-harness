@@ -90,6 +90,34 @@ test('Graph validation stays plain text; basic and lifecycle notifications requi
   assert.equal(items[1].lifecycleEvent,'reauthorizationRequired')
 })
 
+test('APNs native secret bindings invalidate the JWT cache on key changes and never use a stale fallback',async t=>{
+  async function signingKey() {
+    const pair=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify'])
+    const raw=await crypto.subtle.exportKey('pkcs8',pair.privateKey)
+    return {pair,pem:'-----BEGIN PRIVATE KEY-----\n'+Buffer.from(raw).toString('base64')+'\n-----END PRIVATE KEY-----'}
+  }
+  let current=await signingKey(),unavailable=false,reads=0
+  const env={...apnsEnv,APNS_PRIVATE_KEY:{async get() {
+    reads++;if(unavailable)throw Error('private-pem-error');return current.pem
+  }}}
+  const db=storage(t),provider=new APNsTokenProvider(db,env,{now:()=>baseTime})
+  const first=await provider.token()
+  assert.equal((await provider.token()).token,first.token)
+  current=await signingKey();env.APNS_KEY_ID='KEY7654321'
+  const second=await provider.token()
+  assert.notEqual(second.token,first.token)
+  const [header,claims,signature]=second.token.split('.')
+  assert.equal(JSON.parse(Buffer.from(header,'base64url')).kid,'KEY7654321')
+  assert.equal(await crypto.subtle.verify({name:'ECDSA',hash:'SHA-256'},current.pair.publicKey,
+    Buffer.from(signature,'base64url'),new TextEncoder().encode(header+'.'+claims)),true)
+  unavailable=true
+  await assert.rejects(provider.token(),{code:'apns_key_invalid'})
+  unavailable=false
+  assert.equal((await provider.token()).token,second.token)
+  assert.equal(reads,5)
+  assert.doesNotMatch(JSON.stringify(db.sql.exec('SELECT * FROM notification_signer_tokens').toArray()),/BEGIN PRIVATE KEY/)
+})
+
 test('APNs JWT is ES256 signed, sealed and reused across registry reconstruction until rotation',async t=>{
   const pair=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify'])
   const pkcs8=await crypto.subtle.exportKey('pkcs8',pair.privateKey)

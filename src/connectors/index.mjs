@@ -172,20 +172,26 @@ export class ConnectorService {
     assertAuthorized?.()
     check(typeof state==='string' && /^[\w-]{43}$/.test(state),'invalid_connector_oauth_state')
     boundedString(code,8192,'invalid_connector_oauth_code')
-    const saved=this.store.tx(()=>{
-      const row=this.store.one('SELECT * FROM connector_oauth WHERE state=?',state)
-      this.store.rows('DELETE FROM connector_oauth WHERE state=?',state)
-      return row
-    })
+    const saved=this.store.one('SELECT * FROM connector_oauth WHERE state=?',state)
     check(saved && saved.expires>this.now(),'invalid_connector_oauth_state')
     const flow=await this.cipher.open(['connector-oauth',state],saved.sealed)
-    const assertCurrent=()=>{assertAuthorized?.();this.assertLifecycle(flow.lifecycle)}
+    const assertCurrent=()=>{
+      assertAuthorized?.();this.assertLifecycle(flow.lifecycle)
+      if(flow.expectedEpoch!==undefined)this.assertReplacement(flow.id,flow.expectedEpoch,flow.serverId)
+    }
     assertCurrent()
     const server=this.server(flow.serverId)
     check(await fingerprint({endpoint:server.endpoint,oauth:server.oauth})===flow.policyDigest,'connector_oauth_policy_changed',409)
     checkIssuer(flow,iss)
-    if(flow.expectedEpoch!==undefined)this.assertReplacement(flow.id,flow.expectedEpoch,flow.serverId)
-    const secret=await redeemAuthorization(server,flow,code,this.fetcher,{signal,now:this.now(),assertAuthorized:assertCurrent})
+    const secret=await redeemAuthorization(server,flow,code,this.fetcher,{env:this.env,signal,now:this.now(),assertAuthorized:assertCurrent,
+      onDispatch:()=>this.store.tx(()=>{
+        assertCurrent()
+        const current=this.store.one('SELECT * FROM connector_oauth WHERE state=?',state)
+        check(current && current.expires>this.now() && current.sealed===saved.sealed,'invalid_connector_oauth_state')
+        // Consume state atomically immediately before token exchange. A secret
+        // binding outage can be retried, while two callbacks cannot redeem twice.
+        this.store.rows('DELETE FROM connector_oauth WHERE state=?',state)
+      })})
     return this.saveCredential({id:flow.id,expectedEpoch:flow.expectedEpoch,serverId:flow.serverId,secret,lifecycle:flow.lifecycle},{assertAuthorized:assertCurrent})
   }
   revoke(input,expectedEpoch) {
@@ -223,18 +229,26 @@ export class ConnectorService {
     return next
   }
   async refresh(row,secret,{signal,assertAuthorized}) {
-    assertAuthorized?.()
-    this.store.tx(()=>{
+    const assertCurrent=()=>{
+      assertAuthorized?.()
       const current=this.assertEpoch(row.id,row.epoch)
-      check(current.generation===row.generation && !current.refreshing,'connector_changed',409)
-      this.store.rows('UPDATE connector_connections SET refreshing=? WHERE id=?',nonce(),row.id)
-    })
+      check(current.generation===row.generation,'connector_changed',409)
+    }
+    assertCurrent()
+    const marker=nonce()
     let renewed,dispatched=false
     try {
       await this.assertOwner({connectionId:row.id,signal})
-      assertAuthorized?.()
-      dispatched=true
-      renewed=await refreshAuthorization(this.server(row.server),secret,this.fetcher,{signal,now:this.now(),assertAuthorized})
+      assertCurrent()
+      renewed=await refreshAuthorization(this.server(row.server),secret,this.fetcher,{env:this.env,signal,now:this.now(),assertAuthorized:assertCurrent,
+        onDispatch:()=>this.store.tx(()=>{
+          assertCurrent()
+          check(!this.row(row.id).refreshing,'connector_changed',409)
+          // A slow/failed Secrets Store get has not consumed a refresh token.
+          // Only persist an uncertain-outcome marker when dispatch can begin.
+          this.store.rows('UPDATE connector_connections SET refreshing=? WHERE id=?',marker,row.id)
+          dispatched=true
+        })})
       const sealed=await this.cipher.seal(['connector',row.server,row.id],renewed)
       this.store.tx(()=>{
         assertAuthorized?.()
@@ -249,8 +263,8 @@ export class ConnectorService {
     } catch(error) {
       this.store.tx(()=>{
         const current=this.store.one('SELECT * FROM connector_connections WHERE id=?',row.id)
-        if(current?.generation!==row.generation||current.status!=='active')return
-        if(!dispatched||error.httpStatus===429) this.store.rows('UPDATE connector_connections SET refreshing=NULL WHERE id=?',row.id)
+        if(!dispatched||current?.generation!==row.generation||current.status!=='active'||current.refreshing!==marker)return
+        if(error.httpStatus===429) this.store.rows('UPDATE connector_connections SET refreshing=NULL WHERE id=?',row.id)
         else {
           // A rotating refresh token may already have been consumed. Neither a
           // retry nor a DO restart may silently reuse the stale credential.

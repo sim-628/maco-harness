@@ -16,6 +16,15 @@ Clients select that profile name, not a provider URL, secret, package list or
 tools. The default hosted environment is `small`, with networking and desktop
 disabled and a fixed document-library allowlist.
 
+`OPENAI_AGENTS_API_KEY` accepts either an ordinary Worker Secret string or a
+Cloudflare Secrets Store binding. The client reads the binding before each
+provider request, including background polling and cleanup, without retaining a
+raw key in durable job state. Keep a replacement key authorized for the same
+provider project so existing sessions and uploaded files remain accessible.
+Lookup failures before dispatch retry the prepared intent; they do not create an
+ambiguous upload/session receipt. Execution authority is checked again after
+lookup and the dispatch receipt is committed immediately before provider I/O.
+
 `HOSTED_AGENT_TIMEOUT_MS` defaults to five minutes (1 second–30 minutes),
 `HOSTED_AGENT_REQUEST_TIMEOUT_MS` to 20 seconds (1–30 seconds),
 `HOSTED_AGENT_POLL_MS` to 3 seconds (1–30 seconds), and

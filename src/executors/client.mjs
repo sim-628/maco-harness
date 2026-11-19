@@ -1,4 +1,5 @@
 import { withDeadline } from '../deadline.mjs'
+import { hasSecret, readSecret } from '../secrets.mjs'
 
 // Deliberately fixed: the deployment credential must never follow a model- or
 // user-supplied URL. Agents Sessions is a different protocol from Responses.
@@ -46,16 +47,28 @@ export class OpenAIHostedClient {
   }
 
   async request(path, {method = 'GET',body,form,signal,missingOK = false,ack = false,
-    key,binary = false,maxBytes = 4*1024*1024} = {}) {
-    const credential = this.env.OPENAI_AGENTS_API_KEY
-    if (typeof credential !== 'string' || !credential.trim() || /[\r\n]/.test(credential)) {
-      throw hostedError('hosted_not_configured',{status:503})
+    key,binary = false,maxBytes = 4*1024*1024,beforeDispatch,onDispatch} = {}) {
+    if (!hasSecret(this.env.OPENAI_AGENTS_API_KEY)) {
+      throw hostedError('hosted_not_configured',{status:503,beforeDispatch:true})
     }
     const encoded = body === undefined ? undefined : JSON.stringify(body)
     if (encoded && encoder.encode(encoded).length > 4*1024*1024-8192) throw hostedError('hosted_input_too_large')
     if (key !== undefined && !/^[A-Za-z0-9:_-]{1,200}$/.test(key)) throw hostedError('hosted_invalid_idempotency_key')
+    let dispatched = false
     try {
       return await withDeadline(this.timeoutMS,signal,async deadline => {
+        // Resolve for each provider request, including alarms and cleanup. A
+        // binding must not turn into a long-lived copy of an operator's key.
+        const credential = await readSecret(this.env.OPENAI_AGENTS_API_KEY,{
+          signal:deadline,code:'hosted_secret_unavailable',maxBytes:16384,
+        })
+        if (!credential.trim() || /[\r\n]/.test(credential)) throw hostedError('hosted_not_configured',{status:503})
+        // Binding lookup is asynchronous. Recheck the execution before making
+        // the dispatch receipt durable and starting external I/O.
+        await beforeDispatch?.()
+        deadline.throwIfAborted()
+        onDispatch?.()
+        dispatched = true
         const response = await this.fetcher(origin+path,{
           method,redirect:'manual',signal:deadline,
           headers:{Authorization:'Bearer '+credential.trim(),'OpenAI-Beta':'agents=v1',
@@ -83,19 +96,23 @@ export class OpenAIHostedClient {
         } catch { throw hostedError('hosted_invalid_response') }
       })
     } catch (error) {
-      if (typeof error?.code === 'string' && error.code.startsWith('hosted_')) throw error
-      throw hostedError(signal?.aborted ? 'hosted_request_aborted' : 'hosted_unavailable')
+      const safe = typeof error?.code === 'string' && error.code.startsWith('hosted_') ? error
+        : hostedError(signal?.aborted ? 'hosted_request_aborted' : 'hosted_unavailable')
+      if (!dispatched) safe.beforeDispatch = true
+      throw safe
     }
   }
 
-  page(path, {after,order = 'asc',limit = 100,signal} = {}) {
+  page(path, {after,order = 'asc',limit = 100,signal,beforeDispatch} = {}) {
     if (!['asc','desc'].includes(order) || !Number.isInteger(limit) || limit < 1 || limit > 100) throw hostedError('hosted_invalid_page')
     const query = new URLSearchParams({order,limit:String(limit)})
     if (after) query.set('after',id(after))
-    return this.request(path+'?'+query,{signal})
+    return this.request(path+'?'+query,{signal,beforeDispatch})
   }
-  create(body,signal) { return this.request('/agents/sessions',{method:'POST',body,signal}) }
-  retrieve(sessionId,signal) { return this.request('/agents/sessions/'+id(sessionId),{signal,missingOK:true}) }
+  create(body,signal,{beforeDispatch,onDispatch} = {}) {
+    return this.request('/agents/sessions',{method:'POST',body,signal,beforeDispatch,onDispatch})
+  }
+  retrieve(sessionId,signal,{beforeDispatch} = {}) { return this.request('/agents/sessions/'+id(sessionId),{signal,missingOK:true,beforeDispatch}) }
   list(options) { return this.page('/agents/sessions',options) }
   turns(sessionId,options) { return this.page('/agents/sessions/'+id(sessionId)+'/turns',options) }
   items(sessionId,turnId,options) { return this.page('/agents/sessions/'+id(sessionId)+'/turns/'+id(turnId)+'/items',options) }
@@ -105,13 +122,13 @@ export class OpenAIHostedClient {
     })
   }
   remove(sessionId,signal) { return this.request('/agents/sessions/'+id(sessionId),{method:'DELETE',signal,missingOK:true,ack:true}) }
-  upload(bytes,name,signal) {
+  upload(bytes,name,signal,{beforeDispatch,onDispatch} = {}) {
     const form = new FormData()
     form.set('purpose','user_data')
     form.set('expires_after[anchor]','created_at')
     form.set('expires_after[seconds]','3600')
     form.set('file',new Blob([bytes]),name)
-    return this.request('/files',{method:'POST',form,signal})
+    return this.request('/files',{method:'POST',form,signal,beforeDispatch,onDispatch})
   }
   files(options) {
     const query = new URLSearchParams({purpose:'user_data',order:'desc',limit:'100'})
@@ -124,8 +141,8 @@ export class OpenAIHostedClient {
   // a completed turn. Never download an arbitrary URL found in model output.
   // https://developers.openai.com/api/docs/guides/agents-api/environments/files
   artifacts(sessionId,options) { return this.page('/agents/sessions/'+id(sessionId)+'/artifacts',options) }
-  artifactBytes(sessionId,artifactId,maxBytes,signal) {
+  artifactBytes(sessionId,artifactId,maxBytes,signal,{beforeDispatch} = {}) {
     return this.request('/agents/sessions/'+id(sessionId)+'/artifacts/'+id(artifactId)+'/content',
-      {signal,binary:true,maxBytes})
+      {signal,binary:true,maxBytes,beforeDispatch})
   }
 }

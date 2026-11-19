@@ -1,4 +1,5 @@
 import { TEXT_MIMES, abortable, boundedJSON, check, extension, fail, textPrefix } from './io.mjs'
+import { hasSecret, readSecret } from '../secrets.mjs'
 
 export const PARSER_VERSION = 'maco-document-v1'
 const cfExtensions = new Set(['pdf','docx','xlsx','xlsm','xlsb','xls','et','ods','odt','numbers'])
@@ -37,8 +38,8 @@ export function parserFor(asset,env,options = {}) {
   }
   if (parser === 'deepseek') {
     check(ocrExtensions.has(ext),'unsupported_attachment_type')
-    check(typeof env.DEEPSEEK_OCR_API_KEY === 'string' && env.DEEPSEEK_OCR_API_KEY.length > 0 &&
-      env.DEEPSEEK_OCR_API_KEY.length <= 16000 && !/[\x00-\x20\x7f]/.test(env.DEEPSEEK_OCR_API_KEY),'ocr_not_configured',503)
+    check(hasSecret(env.DEEPSEEK_OCR_API_KEY),'ocr_not_configured',503)
+    if (typeof env.DEEPSEEK_OCR_API_KEY === 'string') validateOCRKey(env.DEEPSEEK_OCR_API_KEY)
   }
   return {parser,version:PARSER_VERSION,purpose,extension:ext,
     // Adapter version, content, type and parsing policy form a per-user cache.
@@ -98,16 +99,23 @@ function normalizeOCR(raw) {
     .replace(/<｜\/?ref｜>/gu,'')
 }
 
+function validateOCRKey(key) {
+  check(key.length > 0 && key.length <= 16000 && !/[\x00-\x20\x7f]/.test(key),'ocr_not_configured',503)
+  return key
+}
+
 async function deepseek(asset,bytes,env,{fetcher,maxTextBytes,maxResponseBytes,maxPages,signal,assertCurrent,onDispatch}) {
   const form = new FormData()
   form.set('file',new Blob([bytes],{type:asset.mimeType}),asset.name)
   form.set('purpose',asset.parseOptions.purpose)
+  const credential = validateOCRKey(await readSecret(env.DEEPSEEK_OCR_API_KEY,{signal,code:'ocr_not_configured',maxBytes:16000}))
+  signal?.throwIfAborted()
   assertCurrent()
   onDispatch?.()
   let response
   try {
     response = await fetcher('https://api.deepseek.com/v1/tools/ocr',{
-      method:'POST',headers:{Authorization:'Bearer '+env.DEEPSEEK_OCR_API_KEY},body:form,redirect:'manual',signal,
+      method:'POST',headers:{Authorization:'Bearer '+credential},body:form,redirect:'manual',signal,
     })
   } catch { throw fail('ocr_completion_unknown',502) }
   if (!response.ok) {

@@ -1,4 +1,7 @@
-# A Supabase project using asymmetric JWT signing keys.
+# Local string values. Production supports Worker Secrets or native Secrets Store
+# bindings for secrets; see docs/environment-and-secrets.md. Never put an alias
+# string here expecting automatic lookup. Do not commit real credentials.
+# A Supabase project using asymmetric JWT signing keys; no service_role/anon key needed.
 SUPABASE_URL=
 JWT_AUDIENCE=authenticated
 
@@ -14,7 +17,8 @@ MAX_OPEN_TASKS=32
 MAX_PENDING_OPERATIONS=256
 CONTEXT_INPUT_BYTES=65536
 
-# Generate once per deployment with openssl rand -base64 32. Retain the key across restarts.
+# Generate once for this backend with openssl rand -base64 32; retain the same value.
+# If stored in Secrets Store, use a fixed version. Automatic rotation is unsupported.
 CONNECTION_ENCRYPTION_KEY=
 
 # Register the actual client callback URL with each enabled mail provider.
@@ -39,6 +43,7 @@ DEEPSEEK_OCR_API_KEY=
 # ASSET_AUTO_OCR=deepseek
 
 # Optional complex-task executor. Native mail tasks do not need these.
+# User model keys use encrypted connectionId records, not a global OPENAI_API_KEY.
 # Enable only after setting a model available to this Agents API project.
 HOSTED_AGENT_ENABLED=false
 OPENAI_AGENTS_API_KEY=

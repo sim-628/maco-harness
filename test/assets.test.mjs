@@ -62,6 +62,65 @@ function ocrResult(pages = [{index:0,text:'Invoice total 123.00',finish_reason:'
 }
 const putText = (assets,text = 'hello world',extra = {}) => assets.put({name:'note.txt',mimeType:'text/plain',body:encode(text),...extra})
 
+test('OCR bindings rotate on use and lookup failures remain undispatched and retryable',async t => {
+  let key = 'ocr-key-one', unavailable = true, reads = 0
+  const used = []
+  const f = fixture({env:{DEEPSEEK_OCR_API_KEY:{async get() {
+    reads++; if (unavailable) throw Error('private-secret-store-detail'); return key
+  }}},service:{fetcher:async (_url,init) => {used.push(init.headers.Authorization);return Response.json(ocrResult())}}})
+  t.after(() => f.storage.close())
+  assert.equal(f.assets.capabilities().parsers.deepseek,true)
+  assert.equal(reads,0)
+  const asset = await f.assets.put({name:'scan.pdf',body:pdf})
+  f.assets.parse(asset.id,{parser:'deepseek'})
+  await f.assets.runNext()
+  assert.equal(f.assets.get(asset.id).parse.state,'failed')
+  assert.equal(f.assets.get(asset.id).parse.error,'ocr_not_configured')
+  assert.deepEqual(used,[])
+  unavailable = false
+  f.assets.parse(asset.id,{parser:'deepseek',force:true})
+  await f.assets.runNext()
+  assert.equal(f.assets.get(asset.id).parse.state,'succeeded')
+  key = 'ocr-key-two'
+  f.assets.parse(asset.id,{parser:'deepseek',force:true})
+  await f.assets.cleanup()
+  await f.assets.runNext()
+  assert.equal(f.assets.get(asset.id).parse.state,'succeeded')
+  assert.deepEqual(used,['Bearer ocr-key-one','Bearer ocr-key-two'])
+})
+
+test('OCR cancellation or reconstruction during secret lookup never submits an unfenced parse',async t => {
+  for (const action of ['cancel','reconstruct']) {
+    const gate = deferred(),started = deferred()
+    let reads = 0,calls = 0
+    const f = fixture({env:{DEEPSEEK_OCR_API_KEY:{async get() {
+      reads++; if (reads === 1) {started.resolve();await gate.promise} return 'fixture-key'
+    }}},service:{fetcher:async () => {calls++;return Response.json(ocrResult())}}})
+    t.after(() => f.storage.close())
+    const asset = await f.assets.put({name:'scan.pdf',body:pdf})
+    f.assets.parse(asset.id,{parser:'deepseek'})
+    const controller = new AbortController()
+    const run = f.assets.runNext({signal:controller.signal})
+    await started.promise
+    if (action === 'cancel') {
+      controller.abort()
+      await run
+      assert.equal(f.assets.get(asset.id).parse.state,'failed')
+      assert.equal(calls,0)
+      gate.resolve()
+    } else {
+      const restored = f.reopen()
+      restored.recover()
+      assert.equal(restored.get(asset.id).parse.state,'queued')
+      gate.resolve();await run
+      assert.equal(calls,0)
+      await restored.runNext()
+      assert.equal(restored.get(asset.id).parse.state,'succeeded')
+      assert.equal(calls,1)
+    }
+  }
+})
+
 test('R2 asset identity and public metadata isolate users even with a shared bucket',async () => {
   const a = fixture(),b = fixture({bucket:a.bucket,service:{ownerId:'user-two'}})
   const asset = await putText(a.assets)

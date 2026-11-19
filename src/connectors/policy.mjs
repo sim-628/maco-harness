@@ -76,6 +76,10 @@ export function loadServers(env) {
       oauth.allowedEndpoints.forEach(safeURL)
       if (oauth.resource) safeURL(oauth.resource)
       if (oauth.clientMetadataUrl) safeURL(oauth.clientMetadataUrl)
+      for (const name of [oauth.clientIdEnv,oauth.clientSecretEnv]) {
+        check(name===undefined || typeof name==='string' && /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name) &&
+          !forbiddenKeys.has(name),'invalid_connector_oauth_configuration',503)
+      }
       check(oauth.scopes === undefined || (Array.isArray(oauth.scopes) && oauth.scopes.length <= 64 && oauth.scopes.every(s => typeof s === 'string' && /^[\x21\x23-\x5b\x5d-\x7e]{1,200}$/.test(s))),'invalid_connector_oauth_configuration',503)
     }
     servers.set(id,{id,endpoint,protocolVersion,tools,oauth,allowAnonymous:value.allowAnonymous === true,

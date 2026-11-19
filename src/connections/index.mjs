@@ -145,17 +145,27 @@ export class ConnectionStore {
     assertAuthorized?.();
     const controlEpoch=this.#controlEpoch();
     if (typeof state !== 'string' || !/^[\w-]{43}$/.test(state) || typeof code !== 'string' || !code || code.length > 8192) throw failure('invalid_oauth_callback');
-    // Consume before any provider I/O, so even simultaneous callback deliveries redeem once.
-    const saved = this.#transact(() => {
-      const row = this.#first('SELECT expires,sealed FROM mail_oauth WHERE state=?', state);
-      this.#sql.exec('DELETE FROM mail_oauth WHERE state=?', state);
-      return row;
-    });
+    const saved = this.#first('SELECT expires,sealed FROM mail_oauth WHERE state=?', state);
     if (!saved || saved.expires <= Date.now()) throw failure('invalid_oauth_state');
     const txn = await this.#cipher.open(['oauth', state], saved.sealed);
     const { id, expectedEpoch, provider, actions } = txn;
-    if (id !== undefined) this.#existing(id, expectedEpoch, 'mail', provider);
-    const { secret, scopes, accountId } = await redeemCode(provider, this.#env, code, txn);
+    const assertCurrent = () => {
+      this.#assertControl(controlEpoch);
+      assertAuthorized?.();
+      if (id !== undefined) this.#existing(id, expectedEpoch, 'mail', provider);
+    };
+    assertCurrent();
+    const { secret, scopes, accountId } = await redeemCode(provider, this.#env, code, txn, {
+      assertAuthorized: assertCurrent,
+      // A failed secret lookup does not burn the callback. Claim it atomically
+      // immediately before provider I/O: concurrent callbacks still redeem once.
+      onDispatch: () => this.#transact(() => {
+        assertCurrent();
+        const current = this.#first('SELECT expires,sealed FROM mail_oauth WHERE state=?', state);
+        if (!current || current.expires <= Date.now() || current.sealed !== saved.sealed) throw failure('invalid_oauth_state');
+        this.#sql.exec('DELETE FROM mail_oauth WHERE state=?', state);
+      }),
+    });
     const key = id ?? crypto.randomUUID();
     const sealed = await this.#cipher.seal(['mail', provider, key], secret);
     return this.#transact(() => {
@@ -234,8 +244,14 @@ export class ConnectionStore {
 
   async #refresh(row, previous) {
     let result;
+    const controlEpoch = this.#controlEpoch();
+    const assertAuthorized = () => {
+      this.#assertControl(controlEpoch);
+      const current = this.#row(row.id);
+      if (current.status !== 'active' || current.generation !== row.generation) throw failure('connection_changed', 409);
+    };
     try {
-      result = await refreshGrant(row.provider, this.#env, previous, JSON.parse(row.scopes));
+      result = await refreshGrant(row.provider, this.#env, previous, JSON.parse(row.scopes), { assertAuthorized });
     } catch (error) {
       // A revoked grant observed at the provider invalidates local work, unless
       // the user has already finished authorizing a replacement.

@@ -1,3 +1,5 @@
+import { readSecret } from '../secrets.mjs';
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -34,11 +36,17 @@ export class VaultCipher {
 
   #getKey() {
     if (!this.#key) {
-      try {
-        const raw = decode(this.#material);
-        if (raw.length !== 32) throw failure('vault_key_invalid', 503);
-        this.#key = crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
-      } catch { throw failure('vault_key_invalid', 503); }
+      // The vault master key is a fixed-version secret, unlike an API credential.
+      // Updating it needs a ciphertext migration; do not follow rotating values
+      // within a live vault. A transient initial lookup failure remains retryable.
+      this.#key = (async () => {
+        const material = await readSecret(this.#material, { code: 'vault_key_invalid', maxBytes: 128 });
+        try {
+          const raw = decode(material);
+          if (raw.length !== 32) throw Error();
+          return await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
+        } catch { throw failure('vault_key_invalid', 503); }
+      })().catch(error => { this.#key = undefined; throw error; });
     }
     return this.#key;
   }
