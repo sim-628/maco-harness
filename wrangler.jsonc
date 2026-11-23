@@ -43,6 +43,12 @@
       ]
     }
   ],
+  "services": [
+    {
+      "binding": "MACO_SCHEDULED_MAIL",
+      "service": "maco-agent-cloud"
+    }
+  ],
   "r2_buckets": [
     {
       "binding": "ASSETS"

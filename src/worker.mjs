@@ -4,6 +4,7 @@ import { verifyIdentity } from './auth.mjs'
 import { ApiError, errorCode, requireThat } from './protocol.mjs'
 import { operationView } from './store.mjs'
 import { browserOrigin, preflight, cors } from './http.mjs'
+import { forwardScheduledMail } from './scheduled-mail-compat.mjs'
 import { NotificationRegistryService, createRegistryPort, graphValidationResponse, verifyGmailPush,
   parseGraphPush, verifyGraphItem } from './notifications/index.mjs'
 
@@ -106,7 +107,9 @@ export default {
       headers.set('X-Maco-Expires',String(identity.expires))
       headers.set('X-Maco-Session',identity.sessionId)
       headers.set('X-Maco-Issued-At',String(identity.issuedAt))
-      headers.delete('Authorization')
+      // Scheduled mail shares the Maco Cloud queue and needs the original JWT
+      // for its independent authorization. Other routes use internal identity.
+      if (url.pathname !== '/v1/chat' || request.method !== 'POST') headers.delete('Authorization')
       headers.delete('Cookie')
       const protocols = (headers.get('Sec-WebSocket-Protocol') || '').split(',').map(s => s.trim())
       headers.delete('Sec-WebSocket-Protocol')
@@ -246,6 +249,7 @@ export class MacoAgent extends DurableObject {
     const vault = service.connections
     try {
       service.assertAvailable()
+      if (path === '/v1/chat') return await forwardScheduledMail(request,this.env.MACO_SCHEDULED_MAIL,assertAuthorized)
       if (request.method === 'PUT' && path === '/v1/assets') {
         await service.host.arm()
         assertAuthorized()
