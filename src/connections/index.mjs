@@ -5,6 +5,24 @@ import { compatibleProvider, configuredModelBaseUrl } from '../model/endpoint.mj
 const modelProviders = new Set(['openai', 'anthropic', 'deepseek', compatibleProvider]);
 const oauthLifetime = 10 * 60_000;
 
+const aliasLimit = 100;
+const aliasId = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
+const aliasEmail = /^[A-Za-z0-9.!#$%&'*+/=?^_\x60{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$/;
+const aliasControl = /[\p{Cc}\p{Cf}]/u;
+const aliasEncoder = new TextEncoder();
+
+function validateConfiguredAliases(aliases) {
+  if (!Array.isArray(aliases) || !aliases.length || aliases.length > aliasLimit) throw failure('invalid_mail_aliases');
+  return aliases.map(alias => {
+    if (typeof alias?.id !== 'string' || alias.id.length !== 36 || !aliasId.test(alias.id) ||
+        typeof alias.name !== 'string' || aliasEncoder.encode(alias.name).byteLength > 1024 || aliasControl.test(alias.name) ||
+        typeof alias.address !== 'string' || alias.address.length > 254 || !aliasEmail.test(alias.address) || aliasControl.test(alias.address)) {
+      throw failure('invalid_mail_aliases');
+    }
+    return {id: alias.id.toLowerCase(), name: alias.name, address: alias.address};
+  });
+}
+
 function sameEpoch(row, expectedEpoch) {
   if (!Number.isSafeInteger(expectedEpoch) || row.epoch !== expectedEpoch) throw failure('connection_changed', 409);
 }
@@ -47,6 +65,7 @@ export class ConnectionStore {
       this.#sql.exec('CREATE TABLE IF NOT EXISTS mail_oauth (state TEXT PRIMARY KEY, expires INTEGER NOT NULL, sealed TEXT NOT NULL)');
       // Additive migration leaves existing connection/vault records untouched.
       this.#sql.exec('CREATE TABLE IF NOT EXISTS model_endpoints (connection_id TEXT PRIMARY KEY, base_url TEXT NOT NULL)');
+      this.#sql.exec('CREATE TABLE IF NOT EXISTS configured_mail_aliases (connection_id TEXT PRIMARY KEY, revision TEXT NOT NULL, sealed TEXT NOT NULL)');
     });
     const vault = this.#first('SELECT binding FROM vault_identity WHERE singleton=1');
     this.#cipher = new VaultCipher(env.CONNECTION_ENCRYPTION_KEY, vault.binding);
@@ -58,7 +77,10 @@ export class ConnectionStore {
     return this.#transact(()=>{
       this.#sql.exec('UPDATE vault_lifecycle SET epoch=epoch+1 WHERE singleton=1');
       this.#sql.exec('DELETE FROM mail_oauth');
-      if (revokeConnections) this.#sql.exec("UPDATE connections SET status='revoked',epoch=epoch+1,sealed=NULL,generation=hex(randomblob(16)),actions='[]',scopes='[]'");
+      if (revokeConnections) {
+        this.#sql.exec("UPDATE connections SET status='revoked',epoch=epoch+1,sealed=NULL,generation=hex(randomblob(16)),actions='[]',scopes='[]'");
+        this.#sql.exec('DELETE FROM configured_mail_aliases');
+      }
       return {epoch:this.#controlEpoch()};
     });
   }
@@ -185,6 +207,67 @@ export class ConnectionStore {
     });
   }
 
+  #activeMail(id) {
+    const row = this.#row(id);
+    if (this.assertEpoch(id, row.epoch).kind !== 'mail') throw failure('not_a_mail_connection');
+    return row;
+  }
+
+  #aliasRecord(id) {
+    return this.#first('SELECT revision,sealed FROM configured_mail_aliases WHERE connection_id=?', id);
+  }
+
+  #openAliases(id, record) {
+    return record ? this.#cipher.open(['mail-aliases', id], record.sealed) : [];
+  }
+
+  async configuredAliases(id, {assertAuthorized} = {}) {
+    assertAuthorized?.();
+    const control = this.#controlEpoch();
+    const row = this.#activeMail(id);
+    const aliases = await this.#openAliases(id, this.#aliasRecord(id));
+    this.#assertControl(control);
+    assertAuthorized?.();
+    this.assertEpoch(id, row.epoch);
+    return aliases;
+  }
+
+  async mergeConfiguredAliases({mailboxId, aliases}, {assertAuthorized} = {}) {
+    assertAuthorized?.();
+    const control = this.#controlEpoch();
+    const row = this.#activeMail(mailboxId);
+    const incoming = validateConfiguredAliases(aliases);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const record = this.#aliasRecord(mailboxId);
+      const stored = await this.#openAliases(mailboxId, record);
+      const addresses = new Set(stored.map(alias => alias.address.toLowerCase()));
+      const ids = new Set(stored.map(alias => alias.id));
+      const merged = [...stored];
+      for (const alias of incoming) {
+        const address = alias.address.toLowerCase();
+        if (addresses.has(address)) continue;
+        if (ids.has(alias.id)) throw failure('invalid_mail_aliases');
+        merged.push(alias);
+        addresses.add(address);
+        ids.add(alias.id);
+      }
+      if (merged.length > aliasLimit) throw failure('mail_alias_limit', 409);
+      const sealed = merged.length === stored.length ? null : await this.#cipher.seal(['mail-aliases', mailboxId], merged);
+      const committed = this.#transact(() => {
+        this.#assertControl(control);
+        assertAuthorized?.();
+        this.assertEpoch(mailboxId, row.epoch);
+        if (this.#aliasRecord(mailboxId)?.revision !== record?.revision) return false;
+        if (sealed) this.#sql.exec(`INSERT INTO configured_mail_aliases VALUES (?,?,?)
+          ON CONFLICT(connection_id) DO UPDATE SET revision=excluded.revision,sealed=excluded.sealed`,
+          mailboxId, crypto.randomUUID(), sealed);
+        return true;
+      });
+      if (committed) return merged;
+    }
+    throw failure('connection_changed', 409);
+  }
+
   updateActions(id, actions, expectedEpoch) {
     return this.#transact(() => {
       const current = this.assertEpoch(id, expectedEpoch);
@@ -197,10 +280,11 @@ export class ConnectionStore {
     });
   }
 
-  revoke(id, expectedEpoch) {
+  revoke(id, expectedEpoch, {removeAliases = false} = {}) {
     return this.#transact(() => {
       const row = this.#row(id);
       if (expectedEpoch !== undefined) sameEpoch(row, expectedEpoch);
+      if (removeAliases) this.#sql.exec('DELETE FROM configured_mail_aliases WHERE connection_id=?', id);
       if (row.status === 'active') {
         this.#sql.exec("UPDATE connections SET status='revoked',epoch=epoch+1,sealed=NULL,generation=?,actions='[]',scopes='[]' WHERE id=?", nonce(), id);
       }

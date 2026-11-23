@@ -310,3 +310,31 @@ test('model endpoint migration preserves existing vault identity and preset cred
   assert.deepEqual(await migrated.modelCredential(saved.id,saved.epoch),{apiKey:'preserved-key'});
   assert.equal(migrated.get(saved.id).baseUrl,undefined);
 });
+
+test('configured aliases converge across devices and stay separate from OAuth credentials', async t => {
+  const db = storage(t);
+  const left = new ConnectionStore(db, env);
+  const right = new ConnectionStore(db, env);
+  const unrelated = new ConnectionStore(storage(t), env);
+  t.mock.method(globalThis, 'fetch', async url => url.includes('userinfo')
+    ? Response.json({sub:'aliases-account'}) : Response.json(grant()));
+  const {state} = await left.beginOAuth({provider:'gmail'});
+  const {id:mailboxId, epoch} = await left.completeOAuth({state,code:'fixture-code'});
+  const sales = {id:crypto.randomUUID(),name:'Sales',address:'sales@example.test'};
+  const team = {id:crypto.randomUUID(),name:'Team',address:'team@example.test'};
+  const write = (connection, aliases) => connection.mergeConfiguredAliases({mailboxId,aliases});
+  await Promise.all([write(left,[sales]),write(right,[team])]);
+  const merged = await write(left,[{...sales,id:crypto.randomUUID(),address:'SALES@example.test'}]);
+  assert.deepEqual(merged.sort((a,b)=>a.address.localeCompare(b.address)),[sales,team]);
+  assert.deepEqual((await right.configuredAliases(mailboxId)).sort((a,b)=>a.address.localeCompare(b.address)),[sales,team]);
+  assert.doesNotMatch(db.sql.exec('SELECT sealed FROM configured_mail_aliases').toArray()[0].sealed,/sales@example/);
+  assert.equal(left.get(mailboxId).epoch,epoch);
+  assert.equal(await left.credential(mailboxId,epoch),'secret-mail-access');
+  await assert.rejects(unrelated.configuredAliases(mailboxId),{code:'connection_not_found'});
+  await assert.rejects(write(left,[{...sales,address:'malformed'}]),{code:'invalid_mail_aliases'});
+  left.fence();
+  assert.equal((await right.configuredAliases(mailboxId)).length,2);
+  left.revoke(mailboxId,epoch,{removeAliases:true});
+  assert.equal(db.sql.exec('SELECT COUNT(*) AS count FROM configured_mail_aliases').toArray()[0].count,0);
+  await assert.rejects(right.configuredAliases(mailboxId),{code:'connection_revoked'});
+});
