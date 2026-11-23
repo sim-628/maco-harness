@@ -219,7 +219,9 @@ export class ConnectionStore {
 
   async #openAliases(id, record) {
     const value = record ? await this.#cipher.open(['mail-aliases', id], record.sealed) : [];
-    return Array.isArray(value) ? {aliases:value, aliasSync:{version:0, removed:{}}} : value;
+    if (Array.isArray(value)) return {aliases:value, aliasSync:{version:0, removed:{}, moved:{}}};
+    value.aliasSync.moved ??= {};
+    return value;
   }
 
   async configuredAliases(id, {assertAuthorized} = {}) {
@@ -238,7 +240,7 @@ export class ConnectionStore {
     if (!restoring || typeof restoring !== 'object' || Array.isArray(restoring) || Object.keys(restoring).length > aliasLimit) {
       throw failure('invalid_mail_aliases');
     }
-    return this.#updateAliases(mailboxId, assertAuthorized, ({aliases, aliasSync:{removed}}) => {
+    return this.#updateAliases(mailboxId, assertAuthorized, ({aliases, aliasSync:{removed, moved}}) => {
       const priorCount = aliases.length;
       const addresses = new Set(aliases.map(alias => alias.address.toLowerCase()));
       const ids = new Set(aliases.map(alias => alias.id));
@@ -248,6 +250,7 @@ export class ConnectionStore {
         if (Object.hasOwn(removed, address)) {
           if (typeof restoring[address] !== 'string' || restoring[address].toLowerCase() !== removed[address]) continue;
           delete removed[address];
+          delete moved[address];
         }
         if (ids.has(alias.id)) throw failure('invalid_mail_aliases');
         aliases.push(alias);
@@ -272,6 +275,34 @@ export class ConnectionStore {
       if (index === -1 && Object.hasOwn(removed, key)) return false;
       if (index !== -1) aliases.splice(index, 1);
       removed[key] = crypto.randomUUID();
+      return true;
+    });
+  }
+
+  async editConfiguredAlias({mailboxId, previous, alias, restoring}, {assertAuthorized} = {}) {
+    const [original] = validateConfiguredAliases([previous]);
+    const [edited] = validateConfiguredAliases([alias]);
+    if (original.id !== edited.id || (restoring !== undefined &&
+        (typeof restoring !== 'string' || restoring.length !== 36 || !aliasId.test(restoring)))) {
+      throw failure('invalid_mail_aliases');
+    }
+    const oldAddress = original.address.toLowerCase();
+    const address = edited.address.toLowerCase();
+    return this.#updateAliases(mailboxId, assertAuthorized, ({aliases, aliasSync:{removed, moved}}) => {
+      const index = aliases.findIndex(item => item.id === edited.id);
+      if (index === -1) throw failure('connection_changed', 409);
+      const current = aliases[index];
+      if (current.name === edited.name && current.address === edited.address) return false;
+      if (current.name !== original.name || current.address !== original.address) throw failure('connection_changed', 409);
+      if (aliases.some(item => item.id !== edited.id && item.address.toLowerCase() === address)) throw failure('mail_alias_exists', 409);
+      if (oldAddress !== address) {
+        if (removed[address] !== restoring?.toLowerCase()) throw failure('connection_changed', 409);
+        removed[oldAddress] = crypto.randomUUID();
+        moved[oldAddress] = edited.id;
+        delete removed[address];
+        delete moved[address];
+      }
+      aliases[index] = edited;
       return true;
     });
   }

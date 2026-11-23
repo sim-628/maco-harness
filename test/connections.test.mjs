@@ -343,6 +343,14 @@ test('configured aliases converge across devices and stay separate from OAuth cr
   await assert.rejects(left.removeConfiguredAlias({mailboxId,address:sales.address,expectedAliasId:sales.id}),{code:'connection_changed'});
   await left.removeConfiguredAlias({mailboxId,address:sales.address,expectedAliasId:replacement.id});
   assert.deepEqual((await right.mergeConfiguredAliases(restore)).aliases,[team]);
+  const edited = {...team,name:'Finance',address:'finance@example.test'};
+  const edit = () => left.editConfiguredAlias({mailboxId,previous:team,alias:edited});
+  const changed = await edit();
+  assert.deepEqual(changed.aliases,[edited]);
+  assert.equal(changed.aliasSync.moved[team.address],edited.id);
+  assert.equal((await edit()).aliasSync.version,changed.aliasSync.version);
+  await assert.rejects(left.editConfiguredAlias({mailboxId,previous:team,alias:{...team,name:'Stale'}}),{code:'connection_changed'});
+  assert.deepEqual((await write(right,[team])).aliases,[edited]);
   left.revoke(mailboxId,epoch,{removeAliases:true});
   assert.equal(db.sql.exec('SELECT COUNT(*) AS count FROM configured_mail_aliases').toArray()[0].count,0);
   await assert.rejects(right.configuredAliases(mailboxId),{code:'connection_revoked'});

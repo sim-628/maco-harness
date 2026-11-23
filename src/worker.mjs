@@ -369,6 +369,7 @@ export class MacoAgent extends DurableObject {
         if (path === '/v1/mail/analysis') return json(service.clientState.analysis(body))
         if (path === '/v1/mail/configured-aliases') return json(await vault.mergeConfiguredAliases(body,{assertAuthorized}))
         if (path === '/v1/mail/configured-aliases/remove') return json(await vault.removeConfiguredAlias(body,{assertAuthorized}))
+        if (path === '/v1/mail/configured-aliases/edit') return json(await vault.editConfiguredAlias(body,{assertAuthorized}))
         if (path === '/v1/mail/attachments/import') {
           const meta=service.mail.metadata(body.mailboxId)
           const input=service.index.resolveInput(body.mailboxId,{messageId:body.messageId})

@@ -144,6 +144,7 @@ UI 可以保持一个个人助理入口或统一聊天时间线；相关追问�
 | `GET /v1/mail/configured-aliases` | `mailboxId`；返回 `{aliases:[{id,name,address}],aliasSync:{version,removed}}`，`removed` 为小写地址与删除 UUID 的映射 |
 | `POST /v1/mail/configured-aliases` | `{mailboxId,aliases:[{id,name,address}],restoring?}`；按地址忽略大小写合并。重新添加已删除地址时，`restoring` 必须包含当前删除 UUID。每个邮箱最多 100 个 |
 | `POST /v1/mail/configured-aliases/remove` | `{mailboxId,address,expectedAliasId?}`；删除 Maco 中配置的发件别名并阻止旧设备补传。传入当前别名 ID 可避免并发重加后误删。返回最新同步状态，服务商发送授权不受影响 |
+| `POST /v1/mail/configured-aliases/edit` | `{mailboxId,previous:{id,name,address},alias:{id,name,address},restoring?}`；按原值校验并原子更新，保留别名 ID。地址变更会在 `aliasSync.moved` 中记录旧地址对应的别名 ID，同步时可保留草稿引用 |
 | `GET /v1/mail/raw` | mailboxId、messageId；返回最多 10 MiB 原始 MIME 下载，不写入全文索引 |
 | `GET /v1/mail/delta` | mailboxId、after、limit；本地索引增量与删除 tombstone，游标不是事件 seq |
 | `POST /v1/mail/analysis` | `{mailboxId,messageIds}`，最多 100 个；返回 not_synced / not_analyzed / available / stale |
