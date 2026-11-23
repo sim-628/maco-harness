@@ -23,6 +23,39 @@ function validateConfiguredAliases(aliases) {
   });
 }
 
+const folderRoles=['Drafts','Trash','Spam','Archive','Later'];
+const colors=['Black','Gray','Brown','Red','Orange','Yellow','Lime','Green','Mint','Teal','Cyan','Blue','Indigo','Purple','Pink'];
+const settingsFields=['title','senderName','senderNameWasEdited','color','colorWasEdited','notificationsEnabled',
+  'signatureChoice','signature','signatureID','signatureFormatting','automaticCopy','copyAddresses','folders'];
+const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
+const boundedText=(value,max)=>typeof value==='string'&&aliasEncoder.encode(value).byteLength<=max;
+const shortText=(value,max)=>boundedText(value,max)&&!aliasControl.test(value);
+const isBool=value=>typeof value==='boolean';
+function validSignatureFormat(format,signature) {
+  if(!object(format)||!Array.isArray(format.runs))return false;
+  return format.runs.every(run=>object(run)&&boundedText(run.text,32768)&&isBool(run.bold)&&isBool(run.italic)&&
+    isBool(run.underline)&&Number.isSafeInteger(run.size)&&['system','serif','monospaced'].includes(run.font)&&
+    [run.strikethrough,run.quoted].every(value=>value==null||isBool(value))&&
+    [run.link,run.color,run.highlight].every(value=>value==null||typeof value==='string')&&
+    (run.list==null||['bullet','dash','number'].includes(run.list))&&(run.indent==null||Number.isSafeInteger(run.indent)))&&
+    format.runs.map(run=>run.text).join('')===signature;
+}
+function validMailboxSettings(value) {
+  if(!object(value)||Object.keys(value).some(key=>!settingsFields.includes(key))||
+    !shortText(value.title,1024)||!shortText(value.senderName,1024)||!isBool(value.senderNameWasEdited)||
+    !colors.includes(value.color)||!isBool(value.colorWasEdited)||!isBool(value.notificationsEnabled)||
+    !['none','mostRecent','signature'].includes(value.signatureChoice)||!boundedText(value.signature,32768)||
+    (value.signatureID!=null&&(typeof value.signatureID!=='string'||!aliasId.test(value.signatureID)))||
+    (value.signatureFormatting!=null&&!validSignatureFormat(value.signatureFormatting,value.signature))||
+    !['None','Cc','Bcc'].includes(value.automaticCopy)||!Array.isArray(value.copyAddresses)||
+    value.copyAddresses.length>100||!value.copyAddresses.every(address=>shortText(address,254)&&aliasEmail.test(address))||
+    new Set(value.copyAddresses.map(address=>address.toLowerCase())).size!==value.copyAddresses.length||
+    !object(value.folders))return false;
+  return Object.entries(value.folders).every(([role,folder])=>folderRoles.includes(role)&&object(folder)&&
+    shortText(folder.id,1024)&&folder.id.length>0&&boundedText(folder.name,8192)&&
+    (folder.role==null||[...folderRoles,'Inbox','Sent'].includes(folder.role)))&&aliasEncoder.encode(JSON.stringify(value)).byteLength<=350000;
+}
+
 function sameEpoch(row, expectedEpoch) {
   if (!Number.isSafeInteger(expectedEpoch) || row.epoch !== expectedEpoch) throw failure('connection_changed', 409);
 }
@@ -66,6 +99,7 @@ export class ConnectionStore {
       // Additive migration leaves existing connection/vault records untouched.
       this.#sql.exec('CREATE TABLE IF NOT EXISTS model_endpoints (connection_id TEXT PRIMARY KEY, base_url TEXT NOT NULL)');
       this.#sql.exec('CREATE TABLE IF NOT EXISTS configured_mail_aliases (connection_id TEXT PRIMARY KEY, revision TEXT NOT NULL, sealed TEXT NOT NULL)');
+      this.#sql.exec('CREATE TABLE IF NOT EXISTS configured_mail_settings (connection_id TEXT PRIMARY KEY, version INTEGER NOT NULL, sealed TEXT NOT NULL)');
     });
     const vault = this.#first('SELECT binding FROM vault_identity WHERE singleton=1');
     this.#cipher = new VaultCipher(env.CONNECTION_ENCRYPTION_KEY, vault.binding);
@@ -80,6 +114,7 @@ export class ConnectionStore {
       if (revokeConnections) {
         this.#sql.exec("UPDATE connections SET status='revoked',epoch=epoch+1,sealed=NULL,generation=hex(randomblob(16)),actions='[]',scopes='[]'");
         this.#sql.exec('DELETE FROM configured_mail_aliases');
+        this.#sql.exec('DELETE FROM configured_mail_settings');
       }
       return {epoch:this.#controlEpoch()};
     });
@@ -211,6 +246,42 @@ export class ConnectionStore {
     const row = this.#row(id);
     if (this.assertEpoch(id, row.epoch).kind !== 'mail') throw failure('not_a_mail_connection');
     return row;
+  }
+
+  #settingsRecord(id) {
+    return this.#first('SELECT version,sealed FROM configured_mail_settings WHERE connection_id=?', id);
+  }
+
+  async configuredMailboxSettings(id, {assertAuthorized} = {}) {
+    assertAuthorized?.();
+    const control = this.#controlEpoch();
+    const row = this.#activeMail(id);
+    const record = this.#settingsRecord(id);
+    const value = record ? await this.#cipher.open(['mail-settings', id], record.sealed) : null;
+    this.#assertControl(control);
+    assertAuthorized?.();
+    this.assertEpoch(id, row.epoch);
+    return {version: record?.version ?? 0, value};
+  }
+
+  async saveConfiguredMailboxSettings({mailboxId, value, expectedVersion}, {assertAuthorized} = {}) {
+    assertAuthorized?.();
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0 || !validMailboxSettings(value)) {
+      throw failure('invalid_mail_settings');
+    }
+    const control = this.#controlEpoch();
+    const row = this.#activeMail(mailboxId);
+    const sealed = await this.#cipher.seal(['mail-settings', mailboxId], value);
+    const version = expectedVersion + 1;
+    return this.#transact(() => {
+      this.#assertControl(control);
+      assertAuthorized?.();
+      this.assertEpoch(mailboxId, row.epoch);
+      if ((this.#settingsRecord(mailboxId)?.version ?? 0) !== expectedVersion) throw failure('mail_settings_changed', 409);
+      this.#sql.exec('INSERT INTO configured_mail_settings VALUES (?,?,?) ON CONFLICT(connection_id) DO UPDATE SET version=excluded.version,sealed=excluded.sealed',
+        mailboxId, version, sealed);
+      return {version, value};
+    });
   }
 
   #aliasRecord(id) {
@@ -348,7 +419,10 @@ export class ConnectionStore {
     return this.#transact(() => {
       const row = this.#row(id);
       if (expectedEpoch !== undefined) sameEpoch(row, expectedEpoch);
-      if (removeAliases) this.#sql.exec('DELETE FROM configured_mail_aliases WHERE connection_id=?', id);
+      if (removeAliases) {
+        this.#sql.exec('DELETE FROM configured_mail_aliases WHERE connection_id=?', id);
+        this.#sql.exec('DELETE FROM configured_mail_settings WHERE connection_id=?', id);
+      }
       if (row.status === 'active') {
         this.#sql.exec("UPDATE connections SET status='revoked',epoch=epoch+1,sealed=NULL,generation=?,actions='[]',scopes='[]' WHERE id=?", nonce(), id);
       }

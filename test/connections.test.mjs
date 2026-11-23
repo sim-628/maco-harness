@@ -355,3 +355,33 @@ test('configured aliases converge across devices and stay separate from OAuth cr
   assert.equal(db.sql.exec('SELECT COUNT(*) AS count FROM configured_mail_aliases').toArray()[0].count,0);
   await assert.rejects(right.configuredAliases(mailboxId),{code:'connection_revoked'});
 });
+
+test('mailbox settings replicate, reject stale writes and are erased on mailbox removal', async t => {
+  const db = storage(t);
+  const left = new ConnectionStore(db, env);
+  const right = new ConnectionStore(db, env);
+  const unrelated = new ConnectionStore(storage(t), env);
+  t.mock.method(globalThis, 'fetch', async url => url.includes('userinfo')
+    ? Response.json({sub:'settings-account'}) : Response.json(grant()));
+  const {state} = await left.beginOAuth({provider:'gmail'});
+  const {id:mailboxId, epoch} = await left.completeOAuth({state,code:'fixture-code'});
+  assert.deepEqual(await right.configuredMailboxSettings(mailboxId),{version:0,value:null});
+  const value = {title:'Office',senderName:'Sender',senderNameWasEdited:true,color:'Blue',colorWasEdited:true,
+    notificationsEnabled:false,signatureChoice:'signature',signature:'Regards',automaticCopy:'Bcc',
+    copyAddresses:['first@example.test','second@example.test'],folders:{Trash:{id:'folder-1',name:'Deleted'}}};
+  const write = (connection, expectedVersion, settings) => connection.saveConfiguredMailboxSettings({
+    mailboxId, expectedVersion, value:settings,
+  });
+  await assert.rejects(write(unrelated,0,value),{code:'connection_not_found'});
+  await assert.rejects(write(left,0,{...value,copyAddresses:['invalid']}),{code:'invalid_mail_settings'});
+  await write(left,0,value);
+  assert.doesNotMatch(db.sql.exec('SELECT sealed FROM configured_mail_settings').toArray()[0].sealed,/first@example/);
+  const next = {...value,copyAddresses:['edited@example.test']};
+  const updated = await write(right,1,next);
+  await assert.rejects(write(left,1,value),{code:'mail_settings_changed'});
+  assert.deepEqual(await left.configuredMailboxSettings(mailboxId),updated);
+  assert.equal(left.get(mailboxId).epoch,epoch);
+  left.revoke(mailboxId,epoch,{removeAliases:true});
+  assert.equal(db.sql.exec('SELECT COUNT(*) AS count FROM configured_mail_settings').toArray()[0].count,0);
+  await assert.rejects(right.configuredMailboxSettings(mailboxId),{code:'connection_revoked'});
+});

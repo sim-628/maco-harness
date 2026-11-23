@@ -328,6 +328,7 @@ export class MacoAgent extends DurableObject {
           parentId:url.searchParams.get('parentId') || undefined,cursor:url.searchParams.get('cursor') || '',limit:numberParam(url,'limit',50)},assertAuthorized))
         if (path === '/v1/mail/aliases') return json(await service.mailUI.aliases({mailboxId:url.searchParams.get('mailboxId')},assertAuthorized))
         if (path === '/v1/mail/configured-aliases') return json(await vault.configuredAliases(url.searchParams.get('mailboxId'),{assertAuthorized}))
+        if (path === '/v1/mail/configured-settings') return json(await vault.configuredMailboxSettings(url.searchParams.get('mailboxId'),{assertAuthorized}))
         if (path === '/v1/mail/delta') return json(service.mailUI.delta({mailboxId:url.searchParams.get('mailboxId'),after:numberParam(url,'after',0),limit:numberParam(url,'limit',100)}))
         if (path === '/v1/mail/raw') {
           const mime=await service.mailUI.raw({mailboxId:url.searchParams.get('mailboxId'),messageId:url.searchParams.get('messageId')},assertAuthorized)
@@ -368,6 +369,7 @@ export class MacoAgent extends DurableObject {
         if (path === '/v1/mail/read') return json(await service.read(body,{assertAuthorized}))
         if (path === '/v1/mail/analysis') return json(service.clientState.analysis(body))
         if (path === '/v1/mail/configured-aliases') return json(await vault.mergeConfiguredAliases(body,{assertAuthorized}))
+        if (path === '/v1/mail/configured-settings') return json(await vault.saveConfiguredMailboxSettings(body,{assertAuthorized}))
         if (path === '/v1/mail/configured-aliases/remove') return json(await vault.removeConfiguredAlias(body,{assertAuthorized}))
         if (path === '/v1/mail/configured-aliases/edit') return json(await vault.editConfiguredAlias(body,{assertAuthorized}))
         if (path === '/v1/mail/attachments/import') {
