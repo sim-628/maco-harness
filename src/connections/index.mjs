@@ -217,42 +217,75 @@ export class ConnectionStore {
     return this.#first('SELECT revision,sealed FROM configured_mail_aliases WHERE connection_id=?', id);
   }
 
-  #openAliases(id, record) {
-    return record ? this.#cipher.open(['mail-aliases', id], record.sealed) : [];
+  async #openAliases(id, record) {
+    const value = record ? await this.#cipher.open(['mail-aliases', id], record.sealed) : [];
+    return Array.isArray(value) ? {aliases:value, aliasSync:{version:0, removed:{}}} : value;
   }
 
   async configuredAliases(id, {assertAuthorized} = {}) {
     assertAuthorized?.();
     const control = this.#controlEpoch();
     const row = this.#activeMail(id);
-    const aliases = await this.#openAliases(id, this.#aliasRecord(id));
+    const snapshot = await this.#openAliases(id, this.#aliasRecord(id));
     this.#assertControl(control);
     assertAuthorized?.();
     this.assertEpoch(id, row.epoch);
-    return aliases;
+    return snapshot;
   }
 
-  async mergeConfiguredAliases({mailboxId, aliases}, {assertAuthorized} = {}) {
-    assertAuthorized?.();
-    const control = this.#controlEpoch();
-    const row = this.#activeMail(mailboxId);
+  async mergeConfiguredAliases({mailboxId, aliases, restoring = {}}, {assertAuthorized} = {}) {
     const incoming = validateConfiguredAliases(aliases);
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const record = this.#aliasRecord(mailboxId);
-      const stored = await this.#openAliases(mailboxId, record);
-      const addresses = new Set(stored.map(alias => alias.address.toLowerCase()));
-      const ids = new Set(stored.map(alias => alias.id));
-      const merged = [...stored];
+    if (!restoring || typeof restoring !== 'object' || Array.isArray(restoring) || Object.keys(restoring).length > aliasLimit) {
+      throw failure('invalid_mail_aliases');
+    }
+    return this.#updateAliases(mailboxId, assertAuthorized, ({aliases, aliasSync:{removed}}) => {
+      const priorCount = aliases.length;
+      const addresses = new Set(aliases.map(alias => alias.address.toLowerCase()));
+      const ids = new Set(aliases.map(alias => alias.id));
       for (const alias of incoming) {
         const address = alias.address.toLowerCase();
         if (addresses.has(address)) continue;
+        if (Object.hasOwn(removed, address)) {
+          if (typeof restoring[address] !== 'string' || restoring[address].toLowerCase() !== removed[address]) continue;
+          delete removed[address];
+        }
         if (ids.has(alias.id)) throw failure('invalid_mail_aliases');
-        merged.push(alias);
+        aliases.push(alias);
         addresses.add(address);
         ids.add(alias.id);
       }
-      if (merged.length > aliasLimit) throw failure('mail_alias_limit', 409);
-      const sealed = merged.length === stored.length ? null : await this.#cipher.seal(['mail-aliases', mailboxId], merged);
+      if (aliases.length > aliasLimit) throw failure('mail_alias_limit', 409);
+      return aliases.length !== priorCount;
+    });
+  }
+
+  async removeConfiguredAlias({mailboxId, address, expectedAliasId}, {assertAuthorized} = {}) {
+    if (typeof address !== 'string' || address.length > 254 || !aliasEmail.test(address) || aliasControl.test(address) ||
+        (expectedAliasId !== undefined && (typeof expectedAliasId !== 'string' || expectedAliasId.length !== 36 || !aliasId.test(expectedAliasId)))) {
+      throw failure('invalid_mail_aliases');
+    }
+    const key = address.toLowerCase();
+    const expected = expectedAliasId?.toLowerCase();
+    return this.#updateAliases(mailboxId, assertAuthorized, ({aliases, aliasSync:{removed}}) => {
+      const index = aliases.findIndex(alias => alias.address.toLowerCase() === key);
+      if (index !== -1 && aliases[index].id !== expected) throw failure('connection_changed', 409);
+      if (index === -1 && Object.hasOwn(removed, key)) return false;
+      if (index !== -1) aliases.splice(index, 1);
+      removed[key] = crypto.randomUUID();
+      return true;
+    });
+  }
+
+  async #updateAliases(mailboxId, assertAuthorized, change) {
+    assertAuthorized?.();
+    const control = this.#controlEpoch();
+    const row = this.#activeMail(mailboxId);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const record = this.#aliasRecord(mailboxId);
+      const snapshot = await this.#openAliases(mailboxId, record);
+      const changed = change(snapshot);
+      if (changed) snapshot.aliasSync.version++;
+      const sealed = changed ? await this.#cipher.seal(['mail-aliases', mailboxId], snapshot) : null;
       const committed = this.#transact(() => {
         this.#assertControl(control);
         assertAuthorized?.();
@@ -263,7 +296,7 @@ export class ConnectionStore {
           mailboxId, crypto.randomUUID(), sealed);
         return true;
       });
-      if (committed) return merged;
+      if (committed) return snapshot;
     }
     throw failure('connection_changed', 409);
   }

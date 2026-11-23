@@ -141,8 +141,9 @@ UI 可以保持一个个人助理入口或统一聊天时间线；相关追问�
 | `GET /v1/mail/messages` | mailboxId 必需；query、folderId、cursor、limit（1–50，默认 30）、after、before、unread=1 可选；返回元数据与 opaque cursor |
 | `GET /v1/mail/folders` | mailboxId；可选 parentId、cursor、limit（默认 50） |
 | `GET /v1/mail/aliases` | mailboxId；发送身份发现，当前不开放任意 send-as |
-| `GET /v1/mail/configured-aliases` | `mailboxId`；读取已同步的 `{aliases:[{id,name,address}]}` |
-| `POST /v1/mail/configured-aliases` | `{mailboxId,aliases:[{id,name,address}]}`；按地址忽略大小写合并，保留首次保存的别名，返回合并后的列表，每个邮箱最多 100 个。由已登录设备提交别名，服务商发送授权仍按原有规则验证 |
+| `GET /v1/mail/configured-aliases` | `mailboxId`；返回 `{aliases:[{id,name,address}],aliasSync:{version,removed}}`，`removed` 为小写地址与删除 UUID 的映射 |
+| `POST /v1/mail/configured-aliases` | `{mailboxId,aliases:[{id,name,address}],restoring?}`；按地址忽略大小写合并。重新添加已删除地址时，`restoring` 必须包含当前删除 UUID。每个邮箱最多 100 个 |
+| `POST /v1/mail/configured-aliases/remove` | `{mailboxId,address,expectedAliasId?}`；删除 Maco 中配置的发件别名并阻止旧设备补传。传入当前别名 ID 可避免并发重加后误删。返回最新同步状态，服务商发送授权不受影响 |
 | `GET /v1/mail/raw` | mailboxId、messageId；返回最多 10 MiB 原始 MIME 下载，不写入全文索引 |
 | `GET /v1/mail/delta` | mailboxId、after、limit；本地索引增量与删除 tombstone，游标不是事件 seq |
 | `POST /v1/mail/analysis` | `{mailboxId,messageIds}`，最多 100 个；返回 not_synced / not_analyzed / available / stale |
